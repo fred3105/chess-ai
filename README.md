@@ -8,6 +8,7 @@ There is available code to load PGN games
 
 - [ ] Replace chess package with custom class
 - [ ] Implement min max algorithm to create the chess AI and play with it
+- [ ] Look into selecting better positions for training, seems to have a lot of redundancy so far
 
 ## Get the database
 
@@ -26,3 +27,7 @@ uv run pytest
 ## To train the evaluation function
 
 uv run train.py
+
+## Results for the evaluation function
+
+Current model is the best one so far, probabaly needs to train for longer
