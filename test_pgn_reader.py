@@ -1,5 +1,5 @@
 import numpy as np
-from chess import ChessBoard
+from custom_class import ChessBoard
 
 
 def pgn_final_position(pgn_moves: str, expected_final: np.ndarray):

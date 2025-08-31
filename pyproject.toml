@@ -5,6 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "chess>=1.11.2",
     "numpy>=2.2.6",
     "pytest>=8.4.1",
+    "torch>=2.8.0",
 ]
