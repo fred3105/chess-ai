@@ -30,4 +30,5 @@ uv run train.py
 
 ## Results for the evaluation function
 
-Current model is the best one so far, probabaly needs to train for longer
+Current model is the best one so far, probably need to improve how it's trained, particularly how the board positions are chosen. Needs lots of endgame positions and not be too redundent on openings
+Epoch 100: Train Loss=0.3053, Val Loss=0.3092, Val MAE=0.3769
