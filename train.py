@@ -80,8 +80,141 @@ class ChessDataset(Dataset):
 
 
 # -------------------------
-# 3. Improved MLP model for max speed and accuracy
+# 3. Modern Chess Neural Network Architectures
 # -------------------------
+
+
+class ChessEvalCNN(nn.Module):
+    """Compact CNN architecture with ~1-2M parameters"""
+
+    def __init__(self, dropout_rate=0.2):
+        super().__init__()
+
+        # Input: 18 channels (12 pieces + 4 castling + 1 en passant + 1 halfmove) x 8x8 board
+        # Smaller architecture: 18 -> 16 -> 32 -> 64 channels
+
+        # Convolutional layers with fewer channels
+        self.conv1 = nn.Conv2d(18, 16, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(16)
+
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(32)
+
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(64)
+
+        # ReLU activation for efficiency
+        self.activation = nn.ReLU(inplace=True)
+
+        # Reduced dropout
+        self.dropout = nn.Dropout2d(dropout_rate)
+
+        # Smaller fully connected layers
+        self.fc1 = nn.Linear(64 * 8 * 8, 256)
+        self.bn_fc1 = nn.BatchNorm1d(256)
+        self.fc2 = nn.Linear(256, 128)
+        self.bn_fc2 = nn.BatchNorm1d(128)
+        self.fc_out = nn.Linear(128, 1)
+
+        self._init_weights()
+
+    def forward(self, x):
+        # Reshape from flattened input to 8x8 board with channels
+        batch_size = x.size(0)
+        x = x.view(batch_size, 18, 8, 8)
+
+        # Convolutional layers with batch norm and ReLU
+        x = self.activation(self.bn1(self.conv1(x)))
+        if self.training:
+            x = self.dropout(x)
+
+        x = self.activation(self.bn2(self.conv2(x)))
+        if self.training:
+            x = self.dropout(x)
+
+        x = self.activation(self.bn3(self.conv3(x)))
+        if self.training:
+            x = self.dropout(x)
+
+        # Flatten for fully connected layers
+        x = x.view(batch_size, -1)
+
+        # Fully connected layers with batch norm
+        x = self.activation(self.bn_fc1(self.fc1(x)))
+        if self.training:
+            x = nn.functional.dropout(x, p=0.2)
+
+        x = self.activation(self.bn_fc2(self.fc2(x)))
+        if self.training:
+            x = nn.functional.dropout(x, p=0.2)
+
+        # Output with tanh activation for evaluation score
+        output = torch.tanh(self.fc_out(x))
+        return output
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+                # Xavier initialization for ELU
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+
+class NNUE(nn.Module):
+    """NNUE-style architecture for efficient chess evaluation"""
+
+    def __init__(self, input_size=1152, hidden_size=256):
+        super().__init__()
+
+        # Feature transformer - efficiently updatable part
+        self.feature_transformer = nn.Linear(input_size, hidden_size)
+
+        # Accumulator layers (can be incrementally updated)
+        self.accumulator = nn.Linear(hidden_size, hidden_size // 2)
+
+        # Output layers
+        self.fc1 = nn.Linear(hidden_size // 2, 32)
+        self.fc2 = nn.Linear(32, 32)
+        self.fc_out = nn.Linear(32, 1)
+
+        # Clipped ReLU as used in Stockfish NNUE
+        self.activation = nn.ReLU(inplace=True)
+
+        self._init_weights()
+
+    def forward(self, x):
+        # Feature transformation
+        features = self.activation(self.feature_transformer(x))
+
+        # Clipped ReLU (clip to reasonable range for stability)
+        features = torch.clamp(features, 0, 1)
+
+        # Accumulator
+        accumulated = self.activation(self.accumulator(features))
+        accumulated = torch.clamp(accumulated, 0, 1)
+
+        # Output network
+        h1 = self.activation(self.fc1(accumulated))
+        h2 = self.activation(self.fc2(h1))
+
+        # Final output - no activation, raw evaluation score
+        output = self.fc_out(h2)
+        return output
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # Small weights for NNUE stability
+                nn.init.uniform_(m.weight, -0.1, 0.1)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+
+# Legacy MLP for compatibility/speed comparison
 class EvalNet(nn.Module):
     def __init__(self, input_size=1152, hidden_sizes=[384, 192], dropout_rate=0.15):
         super().__init__()
@@ -184,12 +317,11 @@ def train_model(
     huber_loss = nn.HuberLoss(delta=0.1)  # More robust to outliers
     # L1 regularization computed inline for efficiency
 
-    # Extended cosine annealing with warm restarts for long training
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    # Cosine annealing for the full training duration
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_0=30,
-        T_mult=2,
-        eta_min=min_lr,  # Longer cycles for stability
+        T_max=epochs,
+        eta_min=min_lr,
     )
 
     # Early stopping
@@ -664,27 +796,32 @@ if __name__ == "__main__":
     train_dataset = ChessDataset(positions[train_indices], labels[train_indices])
     val_dataset = ChessDataset(positions[val_indices], labels[val_indices])
 
-    # Optimized batch sizes for M3 Pro
-    # Optimal batch sizes for M3 Pro - larger batches for better gradients
+    # Small batch sizes for compact model
     train_loader = DataLoader(
-        train_dataset, batch_size=2048, shuffle=True, num_workers=0, pin_memory=False
+        train_dataset, batch_size=128, shuffle=True, num_workers=0, pin_memory=False
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=4096, shuffle=False, num_workers=0, pin_memory=False
+        val_dataset, batch_size=256, shuffle=False, num_workers=0, pin_memory=False
     )
+
+    # Choose architecture: CNN (best accuracy) or NNUE (best speed) or EvalNet (legacy)
+    architecture = "NNUE"  # Change to "NNUE" or "EvalNet" to try other architectures
 
     # Initialize wandb experiment tracking
     wandb.init(
         project="chess-eval-optimization",
         name=f"chess-eval-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
         config={
-            "architecture": "EvalNet",
-            "hidden_sizes": [512, 256, 128],
-            "dropout_rate": 0.2,
+            "architecture": architecture,
+            "dropout_rate": 0.3
+            if architecture == "CNN"
+            else (0.0 if architecture == "NNUE" else 0.2),
+            "activation": "ELU" if architecture == "CNN" else "ReLU",
+            "batch_normalization": architecture == "CNN",
             "input_size": 1152,
             "dataset_size": len(positions),
-            "train_batch_size": 2048,
-            "val_batch_size": 4096,
+            "train_batch_size": 256,
+            "val_batch_size": 256,
             "epochs": 400,
             "learning_rate": 1e-3,
             "weight_decay": 5e-5,
@@ -693,14 +830,21 @@ if __name__ == "__main__":
             "augmentation_rate": 0.5,
             "loss_function": "MSE+Huber+L1",
             "optimizer": "AdamW",
-            "scheduler": "CosineAnnealingWarmRestarts",
+            "scheduler": "CosineAnnealingLR",
         },
         tags=["chess", "evaluation", "m3-pro", "optimization"],
         notes="Maximum strength chess evaluation function optimized for M3 Pro",
     )
 
-    # Train maximum-strength model for M3 Pro - balanced size/performance
-    model = EvalNet(hidden_sizes=[512, 256, 128], dropout_rate=0.2)
+    if architecture == "CNN":
+        model = ChessEvalCNN(dropout_rate=0.3)
+        print("Using modern CNN architecture (best for accuracy)")
+    elif architecture == "NNUE":
+        model = NNUE(input_size=1152, hidden_size=256)
+        print("Using NNUE architecture (best for speed)")
+    else:  # EvalNet
+        model = EvalNet(hidden_sizes=[512, 256, 128], dropout_rate=0.2)
+        print("Using legacy MLP architecture")
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model has {total_params:,} parameters")
     print(f"Training on {len(positions):,} total positions")
