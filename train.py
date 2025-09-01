@@ -642,8 +642,8 @@ def fast_eval_batch(model, boards, device="mps"):
 # Example usage
 # -------------------------
 if __name__ == "__main__":
-    # Parse PGNs into .npz dataset
-    parse_pgn_folder("data", "chess_dataset.npz")
+    # Parse PGNs into .npz dataset, only need to do this once
+    # parse_pgn_folder("data", "chess_dataset.npz")
 
     # Load dataset
     data = np.load("chess_dataset.npz")
