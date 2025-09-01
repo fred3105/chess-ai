@@ -568,6 +568,201 @@ class ChessBoard:
 
         return True
 
+    def generate_legal_moves(self):
+        """Generate all legal moves for the current player"""
+        moves = []
+        
+        # Get all pieces for the current player
+        for row in range(8):
+            for col in range(8):
+                piece = self.board[row, col]
+                if piece == 0:
+                    continue
+                    
+                # Check if piece belongs to current player
+                if (self.is_white_to_move() and piece > 0) or (not self.is_white_to_move() and piece < 0):
+                    piece_moves = self.get_piece_moves(row, col, piece)
+                    moves.extend(piece_moves)
+        
+        return moves
+
+    def get_piece_moves(self, row, col, piece):
+        """Get all possible moves for a piece at given position"""
+        moves = []
+        abs_piece = abs(piece)
+        
+        if abs_piece == 1:  # Pawn
+            moves.extend(self.get_pawn_moves(row, col, piece))
+        elif abs_piece == 2:  # Knight
+            moves.extend(self.get_knight_moves(row, col, piece))
+        elif abs_piece == 3:  # Bishop
+            moves.extend(self.get_bishop_moves(row, col, piece))
+        elif abs_piece == 5:  # Rook
+            moves.extend(self.get_rook_moves(row, col, piece))
+        elif abs_piece == 9:  # Queen
+            moves.extend(self.get_queen_moves(row, col, piece))
+        elif abs_piece == 100:  # King
+            moves.extend(self.get_king_moves(row, col, piece))
+            
+        return moves
+
+    def get_pawn_moves(self, row, col, piece):
+        """Generate pawn moves"""
+        moves = []
+        direction = 1 if piece > 0 else -1  # White moves up, black moves down
+        start_row = 1 if piece > 0 else 6
+        
+        # Forward moves
+        new_row = row + direction
+        if self.valid_position(new_row, col) and self.board[new_row, col] == 0:
+            if self.is_legal_move(row, col, new_row, col):
+                moves.append((row, col, new_row, col))
+            
+            # Two squares forward from starting position
+            if row == start_row:
+                new_row = row + 2 * direction
+                if self.valid_position(new_row, col) and self.board[new_row, col] == 0:
+                    if self.is_legal_move(row, col, new_row, col):
+                        moves.append((row, col, new_row, col))
+        
+        # Captures
+        for dc in [-1, 1]:
+            new_row, new_col = row + direction, col + dc
+            if self.valid_position(new_row, new_col):
+                target = self.board[new_row, new_col]
+                if target != 0 and ((piece > 0 and target < 0) or (piece < 0 and target > 0)):
+                    if self.is_legal_move(row, col, new_row, new_col):
+                        moves.append((row, col, new_row, new_col))
+        
+        return moves
+
+    def get_knight_moves(self, row, col, piece):
+        """Generate knight moves"""
+        moves = []
+        knight_moves = [(2, 1), (2, -1), (-2, 1), (-2, -1), (1, 2), (1, -2), (-1, 2), (-1, -2)]
+        
+        for dr, dc in knight_moves:
+            new_row, new_col = row + dr, col + dc
+            if self.valid_position(new_row, new_col):
+                target = self.board[new_row, new_col]
+                if target == 0 or ((piece > 0 and target < 0) or (piece < 0 and target > 0)):
+                    if self.is_legal_move(row, col, new_row, new_col):
+                        moves.append((row, col, new_row, new_col))
+        
+        return moves
+
+    def get_bishop_moves(self, row, col, piece):
+        """Generate bishop moves"""
+        moves = []
+        directions = [(1, 1), (1, -1), (-1, 1), (-1, -1)]
+        
+        for dr, dc in directions:
+            for i in range(1, 8):
+                new_row, new_col = row + i * dr, col + i * dc
+                if not self.valid_position(new_row, new_col):
+                    break
+                    
+                target = self.board[new_row, new_col]
+                if target == 0:
+                    if self.is_legal_move(row, col, new_row, new_col):
+                        moves.append((row, col, new_row, new_col))
+                elif (piece > 0 and target < 0) or (piece < 0 and target > 0):
+                    if self.is_legal_move(row, col, new_row, new_col):
+                        moves.append((row, col, new_row, new_col))
+                    break
+                else:
+                    break
+        
+        return moves
+
+    def get_rook_moves(self, row, col, piece):
+        """Generate rook moves"""
+        moves = []
+        directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        
+        for dr, dc in directions:
+            for i in range(1, 8):
+                new_row, new_col = row + i * dr, col + i * dc
+                if not self.valid_position(new_row, new_col):
+                    break
+                    
+                target = self.board[new_row, new_col]
+                if target == 0:
+                    if self.is_legal_move(row, col, new_row, new_col):
+                        moves.append((row, col, new_row, new_col))
+                elif (piece > 0 and target < 0) or (piece < 0 and target > 0):
+                    if self.is_legal_move(row, col, new_row, new_col):
+                        moves.append((row, col, new_row, new_col))
+                    break
+                else:
+                    break
+        
+        return moves
+
+    def get_queen_moves(self, row, col, piece):
+        """Generate queen moves (combination of rook and bishop)"""
+        moves = []
+        moves.extend(self.get_rook_moves(row, col, piece))
+        moves.extend(self.get_bishop_moves(row, col, piece))
+        return moves
+
+    def get_king_moves(self, row, col, piece):
+        """Generate king moves"""
+        moves = []
+        directions = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)]
+        
+        for dr, dc in directions:
+            new_row, new_col = row + dr, col + dc
+            if self.valid_position(new_row, new_col):
+                target = self.board[new_row, new_col]
+                if target == 0 or ((piece > 0 and target < 0) or (piece < 0 and target > 0)):
+                    if self.is_legal_move(row, col, new_row, new_col):
+                        moves.append((row, col, new_row, new_col))
+        
+        return moves
+
+    def is_legal_move(self, from_row, from_col, to_row, to_col):
+        """Check if a move is legal (doesn't leave king in check)"""
+        # Save original state
+        original_piece = self.board[from_row, from_col]
+        captured_piece = self.board[to_row, to_col]
+        
+        # Make the move temporarily
+        self.board[from_row, from_col] = 0
+        self.board[to_row, to_col] = original_piece
+        
+        # Check if king is in check after this move
+        legal = not self.is_king_in_check()
+        
+        # Restore original state
+        self.board[from_row, from_col] = original_piece
+        self.board[to_row, to_col] = captured_piece
+        
+        return legal
+
+    def make_move(self, move):
+        """Make a move on the board"""
+        from_row, from_col, to_row, to_col = move
+        self.board[to_row, to_col] = self.board[from_row, from_col]
+        self.board[from_row, from_col] = 0
+        self.move_count += 1
+
+    def unmake_move(self, move, captured_piece):
+        """Unmake a move on the board"""
+        from_row, from_col, to_row, to_col = move
+        self.board[from_row, from_col] = self.board[to_row, to_col]
+        self.board[to_row, to_col] = captured_piece
+        self.move_count -= 1
+
+    def copy(self):
+        """Create a deep copy of the board"""
+        new_board = ChessBoard("")
+        new_board.board = self.board.copy()
+        new_board.move_count = self.move_count
+        new_board.white_has_castled = self.white_has_castled
+        new_board.black_has_castled = self.black_has_castled
+        return new_board
+
     def disambiguate_move(self, possible_origins: list, disambiguation: str):
         """Handle disambiguation when multiple pieces can make the same move"""
         if len(possible_origins) == 1:
