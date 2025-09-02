@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import chess.pgn
 import numpy as np
 import os
-import time
-from datetime import datetime
+import gc
+from glob import glob
 
 # Wandb for experiment tracking - install with: pip install wandb
 try:
@@ -143,54 +144,53 @@ class ChessEvalCNN(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
 
-class NNUE(nn.Module):
-    """NNUE-style architecture for efficient chess evaluation"""
+class ChessNet(nn.Module):
+    def __init__(self, device="cpu"):
+        super(ChessNet, self).__init__()
+        self.device = device
 
-    def __init__(self, input_size=768, hidden_size=256):
-        super().__init__()
+        self.conv1 = nn.Conv2d(12, 128, 3, padding=1)
+        self.conv2 = nn.Conv2d(128, 128, 3, padding=1)
+        self.conv3 = nn.Conv2d(128, 128, 3, padding=1)
 
-        # Feature transformer - efficiently updatable part
-        self.feature_transformer = nn.Linear(input_size, hidden_size)
+        # Use GroupNorm instead of BatchNorm for MPS compatibility
+        self.gn1 = nn.GroupNorm(16, 128)  # 16 groups for 128 channels
+        self.gn2 = nn.GroupNorm(16, 128)
+        self.gn3 = nn.GroupNorm(16, 128)
 
-        # Accumulator layers (can be incrementally updated)
-        self.accumulator = nn.Linear(hidden_size, hidden_size // 2)
+        self.policy_conv = nn.Conv2d(128, 73, 1)
+        self.policy_gn = nn.GroupNorm(1, 73)  # 1 group for 73 channels
+        self.policy_fc = nn.Linear(73 * 64, 4672)
 
-        # Output layers
-        self.fc1 = nn.Linear(hidden_size // 2, 32)
-        self.fc2 = nn.Linear(32, 32)
-        self.fc_out = nn.Linear(32, 1)
-
-        # Clipped ReLU as used in Stockfish NNUE
-        self.activation = nn.ReLU(inplace=True)
-
-        self._init_weights()
+        self.value_conv = nn.Conv2d(128, 32, 1)
+        self.value_gn = nn.GroupNorm(4, 32)  # 4 groups for 32 channels
+        self.value_fc1 = nn.Linear(32 * 64, 128)
+        self.value_fc2 = nn.Linear(128, 1)
 
     def forward(self, x):
-        # Feature transformation
-        features = self.activation(self.feature_transformer(x))
+        # Input shape: (batch_size, 8, 8, 12)
+        # Convert to PyTorch format: (batch_size, 12, 8, 8)
+        if len(x.shape) == 4 and x.shape[-1] == 12:
+            x = x.permute(0, 3, 1, 2)
 
-        # Clipped ReLU (clip to reasonable range for stability)
-        features = torch.clamp(features, 0, 1)
+        # Shared layers
+        x = F.relu(self.gn1(self.conv1(x)))
+        x = F.relu(self.gn2(self.conv2(x)))
+        x = F.relu(self.gn3(self.conv3(x)))
 
-        # Accumulator
-        accumulated = self.activation(self.accumulator(features))
-        accumulated = torch.clamp(accumulated, 0, 1)
+        policy = F.relu(self.policy_gn(self.policy_conv(x)))
+        policy = torch.flatten(policy, start_dim=1)  # More MPS-friendly than view
+        policy = self.policy_fc(policy)
+        policy = F.log_softmax(
+            policy, dim=1
+        )  # More numerically stable than softmax + log
 
-        # Output network
-        h1 = self.activation(self.fc1(accumulated))
-        h2 = self.activation(self.fc2(h1))
+        value = F.relu(self.value_gn(self.value_conv(x)))
+        value = torch.flatten(value, start_dim=1)  # More MPS-friendly than view
+        value = F.relu(self.value_fc1(value))
+        value = torch.tanh(self.value_fc2(value))
 
-        # Final output - no activation, raw evaluation score
-        output = self.fc_out(h2)
-        return output
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                # Small weights for NNUE stability
-                nn.init.uniform_(m.weight, -0.1, 0.1)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+        return policy, value
 
 
 # Legacy MLP for compatibility/speed comparison
@@ -249,347 +249,92 @@ class EvalNet(nn.Module):
 
 
 # -------------------------
-# 4. Advanced training loop with optimizations
-# -------------------------
-def train_model(
-    train_loader,
-    val_loader,
-    model,
-    epochs=400,
-    lr=1e-3,
-    device="mps",
-    patience=30,
-    min_lr=1e-7,  # Lower minimum for extended training
-    use_wandb=True,
-):
-    model.to(device)
-    training_start_time = time.time()
-
-    if use_wandb:
-        # Log model architecture and hyperparameters
-        wandb.log(
-            {
-                "model/total_parameters": sum(p.numel() for p in model.parameters()),
-                "model/trainable_parameters": sum(
-                    p.numel() for p in model.parameters() if p.requires_grad
-                ),
-                "hyperparameters/learning_rate": lr,
-                "hyperparameters/weight_decay": 5e-5,
-                "hyperparameters/batch_size_train": train_loader.batch_size,
-                "hyperparameters/batch_size_val": val_loader.batch_size,
-                "hyperparameters/epochs": epochs,
-                "hyperparameters/patience": patience,
-                "hyperparameters/min_lr": min_lr,
-                "dataset/train_size": len(train_loader.dataset),
-                "dataset/val_size": len(val_loader.dataset),
-                "training/device": device,
-            }
-        )
-
-    # Better optimizer with stronger weight decay for large dataset
-    optimizer = optim.AdamW(
-        model.parameters(), lr=lr, weight_decay=1e-4, betas=(0.9, 0.999), eps=1e-8
-    )
-
-    # Use MSE loss for 0-1 normalized outputs
-    mse_loss = nn.MSELoss()
-
-    # Cosine annealing for the full training duration
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=epochs,
-        eta_min=min_lr,
-    )
-
-    # Early stopping
-    best_val_loss = float("inf")
-    patience_counter = 0
-    best_model_state = None
-
-    # Gradient scaler for mixed precision
-    scaler = torch.cuda.amp.GradScaler() if device == "cuda" else None
-
-    training_history = {"train_loss": [], "val_loss": [], "val_mae": [], "lr": []}
-    epoch_start_time = time.time()
-
-    for epoch in range(epochs):
-        # --- Training ---
-        model.train()
-        total_loss = 0
-        num_batches = 0
-
-        for batch_x, batch_y in train_loader:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-
-            # Advanced data augmentation: multiple strategies for robustness
-            if torch.rand(1) < 0.5:  # 50% chance - more aggressive augmentation
-                batch_x, batch_y = augment_position(batch_x, batch_y)
-
-            optimizer.zero_grad()
-
-            # Mixed precision training
-            if scaler is not None:
-                with torch.autocast(device_type=device, dtype=torch.float16):
-                    outputs = model(batch_x).squeeze()
-                    # Simple MSE loss for 0-1 normalized outputs
-                    loss = mse_loss(outputs, batch_y)
-                scaler.scale(loss).backward()
-                # Gradient clipping
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                if device == "mps":
-                    # MPS doesn't support autocast yet, use float32
-                    outputs = model(batch_x).squeeze()
-                else:
-                    with torch.autocast(device_type=device, dtype=torch.float16):
-                        outputs = model(batch_x).squeeze()
-                # Simple MSE loss for MPS
-                loss = mse_loss(outputs, batch_y)
-                loss.backward()
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-
-            total_loss += loss.item()
-            num_batches += 1
-
-        train_loss = total_loss / num_batches
-
-        # --- Validation ---
-        model.eval()
-        val_loss = 0
-        val_mae = 0
-        val_accuracy_05 = 0  # Accuracy within 0.5 evaluation units
-        val_accuracy_02 = 0  # Accuracy within 0.2 evaluation units
-        num_val_batches = 0
-
-        with torch.no_grad():
-            for batch_x, batch_y in val_loader:
-                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-                outputs = model(batch_x).squeeze()
-
-                batch_loss = mse_loss(outputs, batch_y)
-                val_loss += batch_loss.item()
-                val_mae += torch.mean(torch.abs(outputs - batch_y)).item()
-
-                # Accuracy metrics
-                val_accuracy_05 += torch.mean(
-                    (torch.abs(outputs - batch_y) < 0.5).float()
-                ).item()
-                val_accuracy_02 += torch.mean(
-                    (torch.abs(outputs - batch_y) < 0.2).float()
-                ).item()
-
-                num_val_batches += 1
-
-        val_loss /= num_val_batches
-        val_mae /= num_val_batches
-        val_accuracy_05 /= num_val_batches
-        val_accuracy_02 /= num_val_batches
-
-        # Learning rate scheduling
-        scheduler.step()
-        current_lr = optimizer.param_groups[0]["lr"]
-
-        # Calculate epoch time
-        epoch_time = time.time() - epoch_start_time
-        epoch_start_time = time.time()
-
-        # Store training history
-        training_history["train_loss"].append(train_loss)
-        training_history["val_loss"].append(val_loss)
-        training_history["val_mae"].append(val_mae)
-        training_history["lr"].append(current_lr)
-
-        # Run evaluation test every 10 epochs to assess chess strength
-        evaluation_results = None
-        if (
-            epoch + 1
-        ) % 10 == 0 or epoch == 0:  # Run on first epoch and every 10 epochs
-            print(f"\n🧠 Running chess strength evaluation at epoch {epoch + 1}...")
-            evaluation_results = evaluate_model_strength(
-                model, device=device, verbose=False
-            )
-            print(
-                f"   Chess Evaluation - Accuracy: {evaluation_results['accuracy']:.2%} "
-                f"({evaluation_results['correct_positions']}/{evaluation_results['total_positions']}) "
-                f"| Avg Score: {evaluation_results['average_score']:.3f}"
-            )
-
-            # Estimate playing strength based on evaluation performance
-            strength_rating = int(
-                800 + evaluation_results["average_score"] * 1200
-            )  # Scale from 800-2000 ELO
-            print(f"   Estimated Playing Strength: ~{strength_rating} ELO")
-            print()
-
-        # Log to wandb
-        if use_wandb:
-            log_dict = {
-                "epoch": epoch + 1,
-                "train/loss": train_loss,
-                "val/loss": val_loss,
-                "val/mae": val_mae,
-                "val/accuracy_0.5": val_accuracy_05,
-                "val/accuracy_0.2": val_accuracy_02,
-                "training/learning_rate": current_lr,
-                "training/epoch_time_seconds": epoch_time,
-                "training/patience_counter": patience_counter,
-                "training/best_val_loss": best_val_loss,
-            }
-
-            # Add evaluation metrics if available
-            if evaluation_results is not None:
-                log_dict.update(
-                    {
-                        "chess_eval/accuracy": evaluation_results["accuracy"],
-                        "chess_eval/average_score": evaluation_results["average_score"],
-                        "chess_eval/correct_positions": evaluation_results[
-                            "correct_positions"
-                        ],
-                        "chess_eval/estimated_elo": int(
-                            800 + evaluation_results["average_score"] * 1200
-                        ),
-                    }
-                )
-
-            wandb.log(log_dict)
-
-        # Enhanced progress monitoring for long training
-        if epoch % 3 == 0 or epoch < 15:  # More frequent updates early on
-            print(
-                f"Epoch {epoch + 1:03d}: Train Loss={train_loss:.4f}, "
-                f"Val Loss={val_loss:.4f}, Val MAE={val_mae:.4f}, "
-                f"Acc@0.5={val_accuracy_05:.3f}, Acc@0.2={val_accuracy_02:.3f}, "
-                f"LR={current_lr:.2e}, Patience={patience_counter}/{patience}"
-            )
-
-        # Log milestone progress
-        if (epoch + 1) % 50 == 0:
-            elapsed_time = time.time() - training_start_time
-            avg_epoch_time = elapsed_time / (epoch + 1)
-            estimated_remaining = (
-                (epochs - epoch - 1) * avg_epoch_time / 60
-            )  # in minutes
-
-            print(f"\n🏆 MILESTONE: Epoch {epoch + 1}/{epochs} completed")
-            print(f"   Best val loss so far: {best_val_loss:.4f}")
-            print(f"   Elapsed time: {elapsed_time / 60:.1f} minutes")
-            print(f"   Estimated remaining time: {estimated_remaining:.1f} minutes\n")
-
-            if use_wandb:
-                wandb.log(
-                    {
-                        "milestones/epoch": epoch + 1,
-                        "milestones/elapsed_time_minutes": elapsed_time / 60,
-                        "milestones/estimated_remaining_minutes": estimated_remaining,
-                        "milestones/progress_percent": (epoch + 1) / epochs * 100,
-                    }
-                )
-
-        # Early stopping logic
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            best_model_state = model.state_dict().copy()
-        else:
-            patience_counter += 1
-
-        if patience_counter >= patience:
-            print(f"Early stopping at epoch {epoch + 1} (patience={patience})")
-            if use_wandb:
-                wandb.log(
-                    {
-                        "training/early_stopped": True,
-                        "training/final_epoch": epoch + 1,
-                        "training/early_stop_reason": "patience_exceeded",
-                    }
-                )
-            break
-
-    # Calculate final training statistics
-    total_training_time = time.time() - training_start_time
-    final_epoch = len(training_history["train_loss"])
-
-    # Restore best model
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        print(f"Restored best model with validation loss: {best_val_loss:.4f}")
-
-    # Log final training summary
-    if use_wandb:
-        wandb.log(
-            {
-                "training/completed": True,
-                "training/total_time_minutes": total_training_time / 60,
-                "training/total_time_hours": total_training_time / 3600,
-                "training/final_epoch": final_epoch,
-                "training/epochs_per_hour": final_epoch / (total_training_time / 3600),
-                "final/best_val_loss": best_val_loss,
-                "final/train_loss": training_history["train_loss"][-1],
-                "final/val_mae": training_history["val_mae"][-1],
-            }
-        )
-
-        # Log model summary
-        wandb.run.summary.update(
-            {
-                "best_validation_loss": best_val_loss,
-                "final_training_loss": training_history["train_loss"][-1],
-                "total_training_hours": total_training_time / 3600,
-                "epochs_completed": final_epoch,
-            }
-        )
-
-    return training_history
-
-
-# -------------------------
 # 5. PGN parser pipeline -> .npz files
 # -------------------------
-def parse_pgn_folder(pgn_folder, output_file, fetch_only_n_first_moves=None):
+def parse_pgn_file(pgn_file, max_positions=None):
+    """Parse a single PGN file and return positions, labels, and dummy policies"""
     positions = []
     labels = []
+    policies = []
+    games_processed = 0
 
-    max_games = 1000000
+    with open(pgn_file, "r", encoding="utf-8") as f:
+        while True:
+            game = chess.pgn.read_game(f)
+            if game is None:
+                break
+            games_processed += 1
 
-    for filename in os.listdir(pgn_folder):
-        if not filename.endswith(".pgn"):
-            continue
-        filepath = os.path.join(pgn_folder, filename)
-        with open(filepath, "r", encoding="utf-8") as f:
-            while True:
-                game = chess.pgn.read_game(f)
-                if game is None:
+            # Print progress every 1000 games
+            if games_processed % 1000 == 0:
+                print(
+                    f"  Processed {games_processed} games, {len(positions)} positions..."
+                )
+
+            board = game.board()
+            result = game.headers.get("Result", "1/2-1/2")
+            if result == "1-0":
+                outcome = 1.0
+            elif result == "0-1":
+                outcome = -1.0
+            else:
+                outcome = 0.0
+
+            for move in game.mainline_moves():
+                board.push(move)
+                positions.append(encode_board(board))
+                labels.append(outcome)
+                # Create dummy policy (uniform distribution over 4672 possible moves)
+                dummy_policy = np.ones(4672) / 4672
+                policies.append(dummy_policy)
+
+                if max_positions and len(positions) >= max_positions:
                     break
-                board = game.board()
-                result = game.headers.get("Result", "1/2-1/2")
-                if result == "1-0":
-                    outcome = 1.0
-                elif result == "0-1":
-                    outcome = -1.0
-                else:
-                    outcome = 0.0
 
-                for move in game.mainline_moves():
-                    board.push(move)
-                    positions.append(encode_board(board))
-                    labels.append(outcome)
-                    if len(positions) >= max_games and (
-                        fetch_only_n_first_moves is None
-                        or len(positions) <= fetch_only_n_first_moves
-                    ):
-                        break
-                if len(positions) >= max_games:
-                    break
+            if max_positions and len(positions) >= max_positions:
+                print(f"  Reached max positions limit ({max_positions}), stopping...")
+                break
 
-    np.savez_compressed(
-        output_file, positions=np.array(positions), labels=np.array(labels)
-    )
-    print(f"Saved {len(positions)} positions to {output_file}")
+    print(f"  Finished processing {games_processed} games")
+    return np.array(positions), np.array(labels), np.array(policies)
+
+
+def get_pgn_files_from_directory(data_dir):
+    """Get list of all .pgn files from the /data directory"""
+    pgn_files = glob(os.path.join(data_dir, "*.pgn"))
+    return pgn_files
+
+
+# -------------------------
+# AlphaZero Loss and Dataset Classes
+# -------------------------
+
+
+class AlphaLoss(torch.nn.Module):
+    def __init__(self):
+        super(AlphaLoss, self).__init__()
+
+    def forward(self, y_value, value, y_policy, policy):
+        value_error = (value - y_value) ** 2
+        # Use torch.clamp to prevent log(0) and improve numerical stability
+        y_policy_clamped = torch.clamp(y_policy.float(), min=1e-8)
+        policy_error = torch.sum((-policy * torch.log(y_policy_clamped)), 1)
+        total_error = (torch.flatten(value_error).float() + policy_error).mean()
+        return total_error
+
+
+class board_data(Dataset):
+    def __init__(self, dataset):
+        self.X, self.Y, self.policy = dataset
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        state = torch.tensor(self.X[idx], dtype=torch.float32)
+        policy = torch.tensor(self.policy[idx], dtype=torch.float32)
+        value = torch.tensor(self.Y[idx], dtype=torch.float32)
+        return state, policy, value
 
 
 # -------------------------
@@ -597,9 +342,6 @@ def parse_pgn_folder(pgn_folder, output_file, fetch_only_n_first_moves=None):
 # -------------------------
 def augment_position(batch_x, batch_y):
     """Advanced data augmentation for stronger training"""
-    batch_size = batch_x.size(0)
-    # Input is (batch_size, 8, 8, 12)
-
     # Multiple augmentation strategies
     aug_choice = torch.rand(1).item()
 
@@ -690,9 +432,6 @@ def evaluate_model_strength(model, device="mps", verbose=False):
                 # Create board from FEN
                 board = chess.Board(pos_data["fen"])
 
-                # Get model's evaluation of current position
-                current_eval = fast_eval(model, board, device)
-
                 # Test different candidate moves and see if model prefers the best one
                 move_evaluations = []
                 legal_moves = list(board.legal_moves)
@@ -771,335 +510,243 @@ def fast_eval(model, board, device="cpu"):
     model.eval()
     x = torch.tensor(encode_board(board), dtype=torch.float32).unsqueeze(0).to(device)
     with torch.no_grad(), torch.inference_mode():
+        model_output = model(x)
+        # Handle different model outputs
+        if isinstance(model_output, tuple):  # ChessNet returns (policy, value)
+            policy, value = model_output
+            output = value.item()
+        else:  # Other models return single output
+            output = model_output.item()
         # Convert from 0-1 output back to -1 to 1 range
-        output = model(x).item()
         return float(2 * output - 1)
 
 
-def benchmark_model(model, device="mps", num_evals=10000, use_wandb=False):
-    """Benchmark model inference speed for both single and batch evaluation"""
-    import time
-    import chess
-
-    model.to(device)
-    model.eval()
-
-    # JIT compile for maximum speed
-    example_input = torch.randn(1, 8, 8, 12).to(device)
-    jit_model = torch.jit.trace(model, example_input)
-
-    # Create random board positions for benchmarking
-    boards = []
-    for _ in range(100):
-        board = chess.Board()
-        for _ in range(np.random.randint(5, 25)):
-            moves = list(board.legal_moves)
-            if moves:
-                moves_list = list(moves)
-                board.push(moves_list[np.random.randint(len(moves_list))])
-        if not board.is_game_over():
-            boards.append(board)
-
-    print("=== PERFORMANCE BENCHMARKS ===")
-
-    # Test single evaluation
-    print("\n1. Single Position Evaluation:")
-    for _ in range(100):
-        board = np.random.choice(boards)
-        fast_eval(jit_model, board, device)
-
-    start_time = time.time()
-    for i in range(num_evals):
-        board = boards[i % len(boards)]
-        fast_eval(jit_model, board, device)
-    elapsed = time.time() - start_time
-    single_evals_per_second = num_evals / elapsed
-
-    print(f"   Single evals: {single_evals_per_second:8.0f} evals/second")
-
-    # Test batch evaluation (optimal for M3 Pro)
-    print("\n2. Batch Evaluation (Recommended):")
-    batch_sizes = [4, 8, 16, 32, 64]
-    best_throughput = single_evals_per_second
-    best_batch_size = 1
-
-    for batch_size in batch_sizes:
-        # Prepare batch data
-        batch_positions = []
-        for _ in range(batch_size):
-            board = np.random.choice(boards)
-            batch_positions.append(encode_board(board))
-
-        x_batch = torch.tensor(np.array(batch_positions), dtype=torch.float32).to(
-            device
-        )
-
-        # Warmup
-        for _ in range(50):
-            with torch.no_grad():
-                _ = jit_model(x_batch)
-
-        # Benchmark
-        num_batches = num_evals // batch_size
-        start_time = time.time()
-        with torch.no_grad():
-            for _ in range(num_batches):
-                _ = jit_model(x_batch)
-        elapsed = time.time() - start_time
-
-        throughput = (num_batches * batch_size) / elapsed
-        print(f"   Batch {batch_size:2d}: {throughput:10.0f} evals/second")
-
-        if throughput > best_throughput:
-            best_throughput = throughput
-            best_batch_size = batch_size
-
-    print(
-        f"\n🚀 OPTIMAL: {best_throughput:.0f} evals/second (batch size {best_batch_size})"
+def train(
+    net,
+    dataset,
+    epoch_start=0,
+    epoch_stop=20,
+    cpu=0,
+    dataset_name="",
+    global_epoch_offset=0,
+):
+    torch.manual_seed(cpu)
+    # Try MPS with improved tensor operations
+    mps = torch.backends.mps.is_available()
+    device = "mps" if mps else "cpu"
+    print(f"Using device: {device}")
+    net.to(device)
+    net.train()
+    criterion = AlphaLoss()
+    optimizer = optim.Adam(
+        net.parameters(), lr=0.001
+    )  # Reduced learning rate for stability
+    scheduler = optim.lr_scheduler.MultiStepLR(
+        optimizer, milestones=[100, 200, 300, 400], gamma=0.2
     )
-    target_achieved = best_throughput >= 10000
-    print(f"🎯 10k+ target: {'✅ ACHIEVED' if target_achieved else '❌ NOT MET'}")
 
-    if target_achieved:
-        print(f"📈 Exceeds target by {best_throughput - 10000:.0f} evals/second")
+    train_set = board_data(dataset)
+    train_loader = DataLoader(
+        train_set, batch_size=30, shuffle=True, num_workers=0, pin_memory=False
+    )
+    losses_per_epoch = []
+    for epoch in range(epoch_start, epoch_stop):
+        total_loss = 0.0
+        losses_per_batch = []
+        for i, data in enumerate(train_loader, 0):
+            state, policy, value = data
+            if mps:
+                state, policy, value = (
+                    state.to(device).float(),
+                    policy.float().to(device),
+                    value.to(device).float(),
+                )
+            optimizer.zero_grad()
+            policy_pred, value_pred = net(
+                state
+            )  # policy_pred = torch.Size([batch, 4672]) value_pred = torch.Size([batch, 1])
+            loss = criterion(value_pred[:, 0], value, policy_pred, policy)
+            # Check for NaN loss and skip if found
+            if torch.isnan(loss):
+                print(f"Warning: NaN loss detected at batch {i}, skipping...")
+                continue
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            if i % 10 == 9:  # print every 10 mini-batches of size = batch_size
+                avg_loss = total_loss / 10
+                print(
+                    "Process ID: %d [Epoch: %d, %5d/ %d points] total loss per batch: %.3f"
+                    % (
+                        os.getpid(),
+                        epoch + 1,
+                        (i + 1) * 30,
+                        len(train_set),
+                        avg_loss,
+                    )
+                )
 
-    # Log benchmark results to wandb if enabled
-    if use_wandb:
-        wandb.log(
-            {
-                "benchmark/single_eval_throughput": single_evals_per_second,
-                "benchmark/best_throughput": best_throughput,
-                "benchmark/optimal_batch_size": best_batch_size,
-                "benchmark/throughput_improvement": best_throughput
-                / single_evals_per_second,
-            }
+                # Log to Wandb if available
+                if WANDB_AVAILABLE:
+                    wandb.log(
+                        {
+                            "batch_loss": avg_loss,
+                            "learning_rate": optimizer.param_groups[0]["lr"],
+                            "epoch": global_epoch_offset + epoch + 1,
+                            "dataset": dataset_name,
+                            "local_epoch": epoch + 1,
+                            "batch": i + 1,
+                        }
+                    )
+
+                losses_per_batch.append(avg_loss)
+                total_loss = 0.0
+        epoch_loss = (
+            sum(losses_per_batch) / len(losses_per_batch) if losses_per_batch else 0.0
         )
+        losses_per_epoch.append(epoch_loss)
 
-    return best_throughput, best_batch_size
+        # Log epoch metrics to Wandb
+        if WANDB_AVAILABLE:
+            wandb.log(
+                {
+                    "epoch_loss": epoch_loss,
+                    "epoch": global_epoch_offset + epoch + 1,
+                    "dataset": dataset_name,
+                    "local_epoch": epoch + 1,
+                    "learning_rate": optimizer.param_groups[0]["lr"],
+                }
+            )
 
-
-def fast_eval_batch(model, boards, device="mps"):
-    """Evaluate multiple positions efficiently"""
-    model.eval()
-    positions = [encode_board(board) for board in boards]
-    x = torch.tensor(positions, dtype=torch.float32).to(device)
-
-    with torch.no_grad(), torch.inference_mode():
-        outputs = model(x)
-        return [float(out.item()) for out in outputs]
+        scheduler.step()  # Move scheduler step to after epoch completes
+        if len(losses_per_epoch) > 100:
+            if (
+                abs(
+                    sum(losses_per_epoch[-4:-1]) / 3
+                    - sum(losses_per_epoch[-16:-13]) / 3
+                )
+                <= 0.01
+            ):
+                break
 
 
 # -------------------------
 # Example usage
 # -------------------------
 if __name__ == "__main__":
-    # Parse PGNs into .npz dataset, only need to do this once
-    parse_pgn_folder("data", "chess_dataset.npz")
+    # Get list of all .pgn files from /data directory
+    pgn_files = get_pgn_files_from_directory("data")
 
-    # Load dataset
-    data = np.load("chess_dataset.npz")
-    positions = data["positions"]
-    labels = data["labels"]
+    if not pgn_files:
+        print("No .pgn files found in /data directory!")
+        exit(1)
 
-    # Shuffle indices
-    num_samples = len(positions)
-    indices = np.arange(num_samples)
-    np.random.seed(42)
-    np.random.shuffle(indices)
+    print(f"Found {len(pgn_files)} .pgn files to process")
 
-    # 80% train, 20% validation
-    split_idx = int(num_samples * 0.8)
-    train_indices = indices[:split_idx]
-    val_indices = indices[split_idx:]
+    # Initialize ChessNet model for AlphaZero-style training
+    net = ChessNet(device="mps" if torch.backends.mps.is_available() else "cpu")
+    total_params = sum(p.numel() for p in net.parameters())
+    print(f"Model has {total_params:,} parameters")
 
-    train_dataset = ChessDataset(positions[train_indices], labels[train_indices])
-    val_dataset = ChessDataset(positions[val_indices], labels[val_indices])
-
-    # Larger batch sizes for 160M dataset training
-    train_loader = DataLoader(
-        train_dataset, batch_size=256, shuffle=True, num_workers=0, pin_memory=False
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=512, shuffle=False, num_workers=0, pin_memory=False
-    )
-
-    # Choose architecture: CNN (best accuracy) or NNUE (best speed) or EvalNet (legacy)
-    architecture = "CNN"  # Using CNN architecture to match the specified CONV model
-
-    # Initialize wandb experiment tracking if available
+    # Initialize Wandb once for the entire training session
     if WANDB_AVAILABLE:
         wandb.init(
             project="chess-eval-optimization",
-            name=f"chess-eval-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
             config={
-                "architecture": architecture,
-                "dropout_rate": 0.0
-                if architecture == "CNN"
-                else (0.0 if architecture == "NNUE" else 0.2),
-                "activation": "ReLU",
-                "batch_normalization": False,
-                "input_size": 768,  # 8*8*12
-                "dataset_size": len(positions),
-                "train_batch_size": 256,
-                "val_batch_size": 512,
-                "epochs": 500,  # More epochs for 160M dataset
-                "learning_rate": 1e-3,
-                "weight_decay": 1e-4,  # Stronger regularization for large dataset
-                "patience": 50,  # More patience for large dataset
-                "device": "mps",
-                "augmentation_rate": 0.5,
-                "loss_function": "MSE",
-                "optimizer": "AdamW",
-                "scheduler": "CosineAnnealingLR",
+                "architecture": "ChessNet",
+                "learning_rate": 0.001,
+                "batch_size": 30,
+                "epochs_per_dataset": 20,
+                "total_datasets": len(pgn_files),
+                "device": "mps" if torch.backends.mps.is_available() else "cpu",
+                "optimizer": "Adam",
+                "scheduler": "MultiStepLR",
+                "loss_function": "AlphaLoss",
             },
-            tags=["chess", "evaluation", "m3-pro", "conv-architecture"],
-            notes="CONV architecture matching 160M position training setup",
+        )
+        wandb.watch(net, log="all", log_freq=100)
+
+    global_epoch_count = 0
+
+    # Train on each PGN file successively
+    for i, pgn_file in enumerate(pgn_files):
+        print(
+            f"\n=== Training on file {i + 1}/{len(pgn_files)}: {os.path.basename(pgn_file)} ==="
         )
 
-    if architecture == "CNN":
-        model = ChessEvalCNN(dropout_rate=0.0)
-        print("Using CONV CNN architecture with ~3.2M parameters")
-    elif architecture == "NNUE":
-        model = NNUE(input_size=768, hidden_size=256)
-        print("Using NNUE architecture (best for speed)")
-    else:  # EvalNet
-        model = EvalNet(hidden_sizes=[512, 256, 128], dropout_rate=0.2)
-        print("Using legacy MLP architecture")
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model has {total_params:,} parameters")
-    print(f"Training on {len(positions):,} total positions")
+        # Load this specific PGN file with a reasonable limit
+        print(f"Loading {pgn_file}...")
+        positions, labels, policies = parse_pgn_file(pgn_file, max_positions=200000)
+        dataset = (positions, labels, policies)
+        print(f"Loaded {len(positions)} positions")
 
-    # Log model to wandb if available
+        # Train for 20 epochs on this dataset
+        train(
+            net,
+            dataset,
+            epoch_start=0,
+            epoch_stop=20,
+            cpu=0,
+            dataset_name=os.path.basename(pgn_file),
+            global_epoch_offset=global_epoch_count,
+        )
+        global_epoch_count += 20
+
+        # Log model evaluation metrics to Wandb if available
+        if WANDB_AVAILABLE:
+            try:
+                eval_results = evaluate_model_strength(
+                    net, device="mps" if torch.backends.mps.is_available() else "cpu"
+                )
+                wandb.log(
+                    {
+                        "model_accuracy": eval_results["accuracy"],
+                        "model_avg_score": eval_results["average_score"],
+                        "correct_positions": eval_results["correct_positions"],
+                        "total_positions": eval_results["total_positions"],
+                        "dataset": os.path.basename(pgn_file),
+                        "global_epoch": global_epoch_count,
+                    }
+                )
+                print(
+                    f"Model evaluation - Accuracy: {eval_results['accuracy']:.2f}, Avg Score: {eval_results['average_score']:.2f}"
+                )
+            except Exception as e:
+                print(f"Warning: Model evaluation failed: {e}")
+
+        # Save model after each dataset
+        torch.save(net.state_dict(), f"chess_net_dataset_{i + 1}.pth")
+        print(f"Model saved as chess_net_dataset_{i + 1}.pth")
+
+        # Free memory by deleting the dataset and running garbage collection
+        del positions, labels, policies, dataset
+        gc.collect()
+
+        print(f"Completed training on {os.path.basename(pgn_file)}")
+
+    # Save final model
+    torch.save(net.state_dict(), "chess_net_final.pth")
+    print("\n=== Training completed on all datasets ===")
+    print("Final model saved as chess_net_final.pth")
+
+    # Final model evaluation and Wandb cleanup
     if WANDB_AVAILABLE:
-        wandb.watch(model, log="all", log_freq=100)
-
-    # Advanced training recommendations based on dataset size
-    if len(positions) < 1_000_000:
-        print(
-            "⚠️  Dataset is small (<1M positions). Consider gathering more data for stronger evaluation."
-        )
-    elif len(positions) < 5_000_000:
-        print(
-            "📊 Good dataset size (1-5M positions). Should achieve strong amateur-level evaluation."
-        )
-    elif len(positions) < 20_000_000:
-        print(
-            "🎯 Excellent dataset size (5-20M positions). Should achieve master-level evaluation."
-        )
-    else:
-        print(
-            "🚀 Massive dataset size (>20M positions). Should achieve grandmaster-level evaluation!"
-        )
-
-    history = train_model(
-        train_loader,
-        val_loader,
-        model,
-        epochs=500,  # More epochs for 160M dataset
-        lr=1e-3,
-        device="mps",
-        patience=50,  # More patience for large dataset
-        use_wandb=WANDB_AVAILABLE,
-    )
-
-    # Save model and create optimized versions
-    torch.save(model.state_dict(), "chess_eval_net.pth")
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "training_history": history,
-            "model_config": {
-                "hidden_sizes": [384, 192],
-                "dropout_rate": 0.15,
-                "input_size": 1152,
-            },
-        },
-        "chess_eval_net_full.pth",
-    )
-
-    # Create JIT compiled version for maximum speed
-    model.eval()
-    example_input = torch.randn(1, 8, 8, 12)
-    if torch.backends.mps.is_available():
-        example_input = example_input.to("mps")
-    jit_model = torch.jit.trace(model, example_input)
-    jit_model.save("chess_eval_net_jit.pt")
-
-    print("Model saved and JIT compiled.")
-
-    # Comprehensive performance benchmark
-    print("\n" + "=" * 50)
-    print("BENCHMARKING OPTIMIZED MODEL")
-    print("=" * 50)
-    best_throughput, optimal_batch = benchmark_model(
-        model, device="mps", num_evals=10000, use_wandb=True
-    )
-
-    print(f"\n📊 SUMMARY:")
-    print(f"   • Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"   • Peak performance: {best_throughput:,.0f} evals/second")
-    print(f"   • Optimal batch size: {optimal_batch}")
-    print(f"   • Performance vs target: {best_throughput / 10000:.1f}x")
-
-    if best_throughput >= 10000:
-        print(
-            f"\n✅ SUCCESS: Model achieves {best_throughput:,.0f} evals/second on M3 Pro!"
-        )
-        print(
-            f"   Chess engines should use batch size {optimal_batch} for optimal performance."
-        )
-        strength_estimate = min(
-            3000, 1500 + len(positions) / 10000
-        )  # Rough ELO estimate
-        print(f"   Estimated playing strength: ~{strength_estimate:.0f} ELO")
-    else:
-        print(f"\n⚠️  Model achieves {best_throughput:,.0f} evals/second (target: 10k+)")
-        print("   Consider reducing model size if speed is critical.")
-
-    print("\n📈 TRAINING SUMMARY:")
-    print(f"   • Final validation loss: {history['val_loss'][-1]:.4f}")
-    print(f"   • Final validation MAE: {history['val_mae'][-1]:.4f}")
-    print(f"   • Training epochs completed: {len(history['train_loss'])}")
-
-    # Log final performance metrics to wandb
-    if best_throughput >= 10000:
-        strength_estimate = min(3000, 1500 + len(positions) / 10000)
-
-        wandb.log(
-            {
-                "performance/throughput_evals_per_second": best_throughput,
-                "performance/optimal_batch_size": optimal_batch,
-                "performance/target_achieved": True,
-                "performance/estimated_elo": strength_estimate,
-                "performance/speed_vs_target": best_throughput / 10000,
-            }
-        )
-
-        # Create performance summary table
-        performance_table = wandb.Table(
-            columns=["Metric", "Value", "Unit"],
-            data=[
-                ["Throughput", f"{best_throughput:,.0f}", "evals/second"],
-                ["Optimal Batch Size", str(optimal_batch), "positions"],
-                ["Estimated ELO", f"{strength_estimate:.0f}", "rating"],
-                ["Speed vs Target", f"{best_throughput / 10000:.1f}x", "multiplier"],
-                ["Model Parameters", f"{total_params:,}", "parameters"],
-                ["Dataset Size", f"{len(positions):,}", "positions"],
-            ],
-        )
-        wandb.log({"performance/summary_table": performance_table})
-
-    # Save model artifact to wandb
-    model_artifact = wandb.Artifact(
-        name=f"chess-eval-model-{wandb.run.id}",
-        type="model",
-        description="Optimized chess evaluation neural network",
-    )
-    model_artifact.add_file("chess_eval_net.pth")
-    model_artifact.add_file("chess_eval_net_full.pth")
-    model_artifact.add_file("chess_eval_net_jit.pt")
-    wandb.log_artifact(model_artifact)
-
-    # Finish wandb run
-    wandb.finish()
-    print("\n🔗 Training results logged to Weights & Biases!")
+        try:
+            final_eval_results = evaluate_model_strength(
+                net,
+                device="mps" if torch.backends.mps.is_available() else "cpu",
+                verbose=True,
+            )
+            wandb.log(
+                {
+                    "final_model_accuracy": final_eval_results["accuracy"],
+                    "final_model_avg_score": final_eval_results["average_score"],
+                    "final_global_epoch": global_epoch_count,
+                }
+            )
+            print(f"\nFinal Model Performance:")
+            print(f"Accuracy: {final_eval_results['accuracy']:.2f}")
+            print(f"Average Score: {final_eval_results['average_score']:.2f}")
+            wandb.finish()
+        except Exception as e:
+            print(f"Warning: Final evaluation failed: {e}")
