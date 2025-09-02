@@ -40,26 +40,13 @@ PIECE_TO_IDX = {
 
 
 def encode_board(board):
-    planes = np.zeros(
-        (18, 64), dtype=np.float32
-    )  # 12 piece + 4 castling + 1 en passant + 1 halfmove
+    # 12 piece channels only for (8, 8, 12) input format
+    planes = np.zeros((12, 64), dtype=np.float32)  # 12 piece channels only
     piece_map = board.piece_map()
     for square, piece in piece_map.items():
         planes[PIECE_TO_IDX[piece.symbol()], square] = 1.0
 
-    # Castling rights planes
-    planes[12, :] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
-    planes[13, :] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
-    planes[14, :] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
-    planes[15, :] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
-
-    # En passant possible plane
-    planes[16, :] = 1.0 if board.ep_square else 0.0
-
-    # Halfmove clock plane (normalize by 100)
-    planes[17, :] = board.halfmove_clock / 100.0
-
-    return planes.flatten()  # shape (18*64=1152,)
+    return planes.reshape(8, 8, 12)  # shape (8, 8, 12)
 
 
 # -------------------------
@@ -74,9 +61,11 @@ class ChessDataset(Dataset):
         return len(self.positions)
 
     def __getitem__(self, idx):
-        return torch.tensor(self.positions[idx], dtype=torch.float32), torch.tensor(
-            self.labels[idx], dtype=torch.float32
-        )
+        # Convert position to proper shape and normalize labels to 0-1 range
+        position = torch.tensor(self.positions[idx], dtype=torch.float32)
+        # Normalize label from [-1, 1] to [0, 1]
+        label = torch.tensor((self.labels[idx] + 1) / 2, dtype=torch.float32)
+        return position, label
 
 
 # -------------------------
@@ -85,71 +74,61 @@ class ChessDataset(Dataset):
 
 
 class ChessEvalCNN(nn.Module):
-    """Compact CNN architecture with ~1-2M parameters"""
+    """CNN architecture matching the specified CONV model with ~3.2M parameters"""
 
-    def __init__(self, dropout_rate=0.2):
+    def __init__(self, dropout_rate=0.0):
         super().__init__()
 
-        # Input: 18 channels (12 pieces + 4 castling + 1 en passant + 1 halfmove) x 8x8 board
-        # Smaller architecture: 18 -> 16 -> 32 -> 64 channels
+        # Input: 12 channels (pieces only) x 8x8 board
+        # Architecture: 12 -> 768 -> 384 -> 192 channels
 
-        # Convolutional layers with fewer channels
-        self.conv1 = nn.Conv2d(18, 16, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(16)
+        # First conv: (8,8,12) -> (4,4,768) with stride 2
+        self.conv1 = nn.Conv2d(12, 768, kernel_size=3, stride=2, padding=1)
 
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(32)
+        # Second conv: (4,4,768) -> (2,2,384) with stride 2
+        self.conv2 = nn.Conv2d(768, 384, kernel_size=3, stride=2, padding=1)
 
-        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.bn3 = nn.BatchNorm2d(64)
+        # Third conv: (2,2,384) -> (1,1,192) with stride 2
+        self.conv3 = nn.Conv2d(384, 192, kernel_size=3, stride=2, padding=1)
 
-        # ReLU activation for efficiency
+        # Flatten: (1,1,192) -> (192,)
+        self.flatten = nn.Flatten()
+
+        # Dense layers: 192 -> 96 -> 1
+        self.fc1 = nn.Linear(192, 96)
+        self.fc_out = nn.Linear(96, 1)
+
+        # ReLU activation
         self.activation = nn.ReLU(inplace=True)
-
-        # Reduced dropout
-        self.dropout = nn.Dropout2d(dropout_rate)
-
-        # Smaller fully connected layers
-        self.fc1 = nn.Linear(64 * 8 * 8, 256)
-        self.bn_fc1 = nn.BatchNorm1d(256)
-        self.fc2 = nn.Linear(256, 128)
-        self.bn_fc2 = nn.BatchNorm1d(128)
-        self.fc_out = nn.Linear(128, 1)
 
         self._init_weights()
 
     def forward(self, x):
-        # Reshape from flattened input to 8x8 board with channels
-        batch_size = x.size(0)
-        x = x.view(batch_size, 18, 8, 8)
+        # Input shape: (batch_size, 8, 8, 12)
+        # Convert to PyTorch format: (batch_size, 12, 8, 8)
+        if len(x.shape) == 4 and x.shape[-1] == 12:
+            x = x.permute(
+                0, 3, 1, 2
+            )  # (batch, height, width, channels) -> (batch, channels, height, width)
 
-        # Convolutional layers with batch norm and ReLU
-        x = self.activation(self.bn1(self.conv1(x)))
-        if self.training:
-            x = self.dropout(x)
+        # First conv: (batch, 12, 8, 8) -> (batch, 768, 4, 4)
+        x = self.activation(self.conv1(x))
 
-        x = self.activation(self.bn2(self.conv2(x)))
-        if self.training:
-            x = self.dropout(x)
+        # Second conv: (batch, 768, 4, 4) -> (batch, 384, 2, 2)
+        x = self.activation(self.conv2(x))
 
-        x = self.activation(self.bn3(self.conv3(x)))
-        if self.training:
-            x = self.dropout(x)
+        # Third conv: (batch, 384, 2, 2) -> (batch, 192, 1, 1)
+        x = self.activation(self.conv3(x))
 
-        # Flatten for fully connected layers
-        x = x.view(batch_size, -1)
+        # Flatten: (batch, 192, 1, 1) -> (batch, 192)
+        x = self.flatten(x)
 
-        # Fully connected layers with batch norm
-        x = self.activation(self.bn_fc1(self.fc1(x)))
-        if self.training:
-            x = nn.functional.dropout(x, p=0.2)
+        # Dense layer: (batch, 192) -> (batch, 96)
+        x = self.activation(self.fc1(x))
 
-        x = self.activation(self.bn_fc2(self.fc2(x)))
-        if self.training:
-            x = nn.functional.dropout(x, p=0.2)
-
-        # Output with tanh activation for evaluation score
-        output = torch.tanh(self.fc_out(x))
+        # Output layer: (batch, 96) -> (batch, 1)
+        # Use sigmoid for 0-1 normalized output
+        output = torch.sigmoid(self.fc_out(x))
         return output
 
     def _init_weights(self):
@@ -167,7 +146,7 @@ class ChessEvalCNN(nn.Module):
 class NNUE(nn.Module):
     """NNUE-style architecture for efficient chess evaluation"""
 
-    def __init__(self, input_size=1152, hidden_size=256):
+    def __init__(self, input_size=768, hidden_size=256):
         super().__init__()
 
         # Feature transformer - efficiently updatable part
@@ -216,7 +195,7 @@ class NNUE(nn.Module):
 
 # Legacy MLP for compatibility/speed comparison
 class EvalNet(nn.Module):
-    def __init__(self, input_size=1152, hidden_sizes=[384, 192], dropout_rate=0.15):
+    def __init__(self, input_size=768, hidden_sizes=[384, 192], dropout_rate=0.15):
         super().__init__()
         self.input_size = input_size
         self.hidden_sizes = hidden_sizes
@@ -307,15 +286,13 @@ def train_model(
             }
         )
 
-    # Better optimizer with weight decay
+    # Better optimizer with stronger weight decay for large dataset
     optimizer = optim.AdamW(
-        model.parameters(), lr=lr, weight_decay=5e-5, betas=(0.9, 0.999), eps=1e-8
+        model.parameters(), lr=lr, weight_decay=1e-4, betas=(0.9, 0.999), eps=1e-8
     )
 
-    # Advanced loss components for stronger training
+    # Use MSE loss for 0-1 normalized outputs
     mse_loss = nn.MSELoss()
-    huber_loss = nn.HuberLoss(delta=0.1)  # More robust to outliers
-    # L1 regularization computed inline for efficiency
 
     # Cosine annealing for the full training duration
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -354,17 +331,8 @@ def train_model(
             if scaler is not None:
                 with torch.autocast(device_type=device, dtype=torch.float16):
                     outputs = model(batch_x).squeeze()
-                    # Advanced combined loss: MSE + Huber + L1 regularization
-                    prediction_loss = 0.6 * mse_loss(
-                        outputs, batch_y
-                    ) + 0.4 * huber_loss(outputs, batch_y)
-
-                    # L1 regularization on model weights for sparsity
-                    l1_reg = sum(
-                        torch.sum(torch.abs(param)) for param in model.parameters()
-                    )
-
-                    loss = prediction_loss + 1e-6 * l1_reg
+                    # Simple MSE loss for 0-1 normalized outputs
+                    loss = mse_loss(outputs, batch_y)
                 scaler.scale(loss).backward()
                 # Gradient clipping
                 scaler.unscale_(optimizer)
@@ -378,17 +346,8 @@ def train_model(
                 else:
                     with torch.autocast(device_type=device, dtype=torch.float16):
                         outputs = model(batch_x).squeeze()
-                # Advanced combined loss for MPS
-                prediction_loss = 0.6 * mse_loss(outputs, batch_y) + 0.4 * huber_loss(
-                    outputs, batch_y
-                )
-
-                # L1 regularization on model weights
-                l1_reg = sum(
-                    torch.sum(torch.abs(param)) for param in model.parameters()
-                )
-
-                loss = prediction_loss + 1e-6 * l1_reg
+                # Simple MSE loss for MPS
+                loss = mse_loss(outputs, batch_y)
                 loss.backward()
                 # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -558,7 +517,7 @@ def parse_pgn_folder(pgn_folder, output_file, fetch_only_n_first_moves=None):
     positions = []
     labels = []
 
-    max_games = 200000
+    max_games = 1000000
 
     for filename in os.listdir(pgn_folder):
         if not filename.endswith(".pgn"):
@@ -602,53 +561,32 @@ def parse_pgn_folder(pgn_folder, output_file, fetch_only_n_first_moves=None):
 def augment_position(batch_x, batch_y):
     """Advanced data augmentation for stronger training"""
     batch_size = batch_x.size(0)
-    x_reshaped = batch_x.view(batch_size, 18, 64)
+    # Input is (batch_size, 8, 8, 12)
 
     # Multiple augmentation strategies
     aug_choice = torch.rand(1).item()
 
     if aug_choice < 0.4:  # 40% - Horizontal flip
-        x_aug = x_reshaped.clone()
-        for i in range(8):  # For each rank
-            for j in range(8):  # For each file
-                old_idx = i * 8 + j
-                new_idx = i * 8 + (7 - j)  # Mirror horizontally
-                x_aug[:, :, new_idx] = x_reshaped[:, :, old_idx]
-        y_aug = -batch_y  # Flip evaluation
+        x_aug = batch_x.clone()
+        x_aug = torch.flip(x_aug, dims=[2])  # Flip along width dimension
+        y_aug = 1 - batch_y  # Flip evaluation for 0-1 range
 
     elif aug_choice < 0.7:  # 30% - Perspective flip (white<->black)
-        x_aug = x_reshaped.clone()
-        # Swap white and black pieces (0-5 <-> 6-11)
-        for i in range(6):
-            temp = x_aug[:, i, :].clone()
-            x_aug[:, i, :] = x_aug[:, i + 6, :]
-            x_aug[:, i + 6, :] = temp
-
-        # Flip castling rights (12-13 <-> 14-15)
-        temp = x_aug[:, 12:14, :].clone()
-        x_aug[:, 12:14, :] = x_aug[:, 14:16, :]
-        x_aug[:, 14:16, :] = temp
+        x_aug = batch_x.clone()
+        # Swap white and black pieces (channels 0-5 <-> 6-11)
+        temp = x_aug[:, :, :, 0:6].clone()
+        x_aug[:, :, :, 0:6] = x_aug[:, :, :, 6:12]
+        x_aug[:, :, :, 6:12] = temp
 
         # Flip board vertically (rank 1->8, 2->7, etc)
-        x_flipped = torch.zeros_like(x_aug)
-        for rank in range(8):
-            for file in range(8):
-                old_square = rank * 8 + file
-                new_square = (7 - rank) * 8 + file
-                x_flipped[:, :, new_square] = x_aug[:, :, old_square]
+        x_aug = torch.flip(x_aug, dims=[1])  # Flip along height dimension
+        y_aug = 1 - batch_y  # Flip evaluation from opponent perspective
 
-        x_aug = x_flipped
-        y_aug = -batch_y  # Flip evaluation from opponent perspective
-
-    else:  # 30% - Small noise for robustness
-        x_aug = x_reshaped.clone()
-        # Add small amount of noise to non-piece planes (castling, en passant, halfmove)
-        noise_scale = 0.05
-        x_aug[:, 12:, :] += torch.randn_like(x_aug[:, 12:, :]) * noise_scale
-        x_aug[:, 12:, :] = torch.clamp(x_aug[:, 12:, :], 0, 1)  # Keep in valid range
+    else:  # 30% - Keep original
+        x_aug = batch_x.clone()
         y_aug = batch_y  # Keep same evaluation
 
-    return x_aug.view(batch_size, -1), y_aug
+    return x_aug, y_aug
 
 
 # -------------------------
@@ -659,7 +597,9 @@ def fast_eval(model, board, device="cpu"):
     model.eval()
     x = torch.tensor(encode_board(board), dtype=torch.float32).unsqueeze(0).to(device)
     with torch.no_grad(), torch.inference_mode():
-        return float(model(x).item())
+        # Convert from 0-1 output back to -1 to 1 range
+        output = model(x).item()
+        return float(2 * output - 1)
 
 
 def benchmark_model(model, device="mps", num_evals=10000, use_wandb=False):
@@ -671,7 +611,7 @@ def benchmark_model(model, device="mps", num_evals=10000, use_wandb=False):
     model.eval()
 
     # JIT compile for maximum speed
-    example_input = torch.randn(1, 1152).to(device)
+    example_input = torch.randn(1, 8, 8, 12).to(device)
     jit_model = torch.jit.trace(model, example_input)
 
     # Create random board positions for benchmarking
@@ -681,8 +621,10 @@ def benchmark_model(model, device="mps", num_evals=10000, use_wandb=False):
         for _ in range(np.random.randint(5, 25)):
             moves = list(board.legal_moves)
             if moves:
-                board.push(np.random.choice(moves))
-        boards.append(board)
+                moves_list = list(moves)
+                board.push(moves_list[np.random.randint(len(moves_list))])
+        if not board.is_game_over():
+            boards.append(board)
 
     print("=== PERFORMANCE BENCHMARKS ===")
 
@@ -778,11 +720,10 @@ def fast_eval_batch(model, boards, device="mps"):
 # -------------------------
 if __name__ == "__main__":
     # Parse PGNs into .npz dataset, only need to do this once
-    # parse_pgn_folder("data", "chess_dataset.npz")
-    parse_pgn_folder("data", "chess_openings.npz")
+    parse_pgn_folder("data", "chess_dataset.npz")
 
     # Load dataset
-    data = np.load("chess_openings.npz")
+    data = np.load("chess_dataset.npz")
     positions = data["positions"]
     labels = data["labels"]
 
@@ -800,51 +741,52 @@ if __name__ == "__main__":
     train_dataset = ChessDataset(positions[train_indices], labels[train_indices])
     val_dataset = ChessDataset(positions[val_indices], labels[val_indices])
 
-    # Small batch sizes for compact model
+    # Larger batch sizes for 160M dataset training
     train_loader = DataLoader(
-        train_dataset, batch_size=128, shuffle=True, num_workers=0, pin_memory=False
+        train_dataset, batch_size=256, shuffle=True, num_workers=0, pin_memory=False
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=256, shuffle=False, num_workers=0, pin_memory=False
+        val_dataset, batch_size=512, shuffle=False, num_workers=0, pin_memory=False
     )
 
     # Choose architecture: CNN (best accuracy) or NNUE (best speed) or EvalNet (legacy)
-    architecture = "NNUE"  # Change to "NNUE" or "EvalNet" to try other architectures
+    architecture = "CNN"  # Using CNN architecture to match the specified CONV model
 
-    # Initialize wandb experiment tracking
-    wandb.init(
-        project="chess-eval-optimization",
-        name=f"chess-eval-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
-        config={
-            "architecture": architecture,
-            "dropout_rate": 0.3
-            if architecture == "CNN"
-            else (0.0 if architecture == "NNUE" else 0.2),
-            "activation": "ELU" if architecture == "CNN" else "ReLU",
-            "batch_normalization": architecture == "CNN",
-            "input_size": 1152,
-            "dataset_size": len(positions),
-            "train_batch_size": 256,
-            "val_batch_size": 256,
-            "epochs": 400,
-            "learning_rate": 1e-3,
-            "weight_decay": 5e-5,
-            "patience": 30,
-            "device": "mps",
-            "augmentation_rate": 0.5,
-            "loss_function": "MSE+Huber+L1",
-            "optimizer": "AdamW",
-            "scheduler": "CosineAnnealingLR",
-        },
-        tags=["chess", "evaluation", "m3-pro", "optimization"],
-        notes="Maximum strength chess evaluation function optimized for M3 Pro",
-    )
+    # Initialize wandb experiment tracking if available
+    if WANDB_AVAILABLE:
+        wandb.init(
+            project="chess-eval-optimization",
+            name=f"chess-eval-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+            config={
+                "architecture": architecture,
+                "dropout_rate": 0.0
+                if architecture == "CNN"
+                else (0.0 if architecture == "NNUE" else 0.2),
+                "activation": "ReLU",
+                "batch_normalization": False,
+                "input_size": 768,  # 8*8*12
+                "dataset_size": len(positions),
+                "train_batch_size": 256,
+                "val_batch_size": 512,
+                "epochs": 500,  # More epochs for 160M dataset
+                "learning_rate": 1e-3,
+                "weight_decay": 1e-4,  # Stronger regularization for large dataset
+                "patience": 50,  # More patience for large dataset
+                "device": "mps",
+                "augmentation_rate": 0.5,
+                "loss_function": "MSE",
+                "optimizer": "AdamW",
+                "scheduler": "CosineAnnealingLR",
+            },
+            tags=["chess", "evaluation", "m3-pro", "conv-architecture"],
+            notes="CONV architecture matching 160M position training setup",
+        )
 
     if architecture == "CNN":
-        model = ChessEvalCNN(dropout_rate=0.3)
-        print("Using modern CNN architecture (best for accuracy)")
+        model = ChessEvalCNN(dropout_rate=0.0)
+        print("Using CONV CNN architecture with ~3.2M parameters")
     elif architecture == "NNUE":
-        model = NNUE(input_size=1152, hidden_size=256)
+        model = NNUE(input_size=768, hidden_size=256)
         print("Using NNUE architecture (best for speed)")
     else:  # EvalNet
         model = EvalNet(hidden_sizes=[512, 256, 128], dropout_rate=0.2)
@@ -853,8 +795,9 @@ if __name__ == "__main__":
     print(f"Model has {total_params:,} parameters")
     print(f"Training on {len(positions):,} total positions")
 
-    # Log model to wandb
-    wandb.watch(model, log="all", log_freq=100)
+    # Log model to wandb if available
+    if WANDB_AVAILABLE:
+        wandb.watch(model, log="all", log_freq=100)
 
     # Advanced training recommendations based on dataset size
     if len(positions) < 1_000_000:
@@ -878,11 +821,11 @@ if __name__ == "__main__":
         train_loader,
         val_loader,
         model,
-        epochs=400,
+        epochs=500,  # More epochs for 160M dataset
         lr=1e-3,
         device="mps",
-        patience=30,
-        use_wandb=True,
+        patience=50,  # More patience for large dataset
+        use_wandb=WANDB_AVAILABLE,
     )
 
     # Save model and create optimized versions
@@ -902,7 +845,7 @@ if __name__ == "__main__":
 
     # Create JIT compiled version for maximum speed
     model.eval()
-    example_input = torch.randn(1, 1152)
+    example_input = torch.randn(1, 8, 8, 12)
     if torch.backends.mps.is_available():
         example_input = example_input.to("mps")
     jit_model = torch.jit.trace(model, example_input)

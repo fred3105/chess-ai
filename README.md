@@ -11,6 +11,10 @@ There is available code to load PGN games
 - [ ] Create openings dataset to train on openings
 - [ ] Create endgames dataset to train on endings
 - [ ] Look into selecting better positions for training, seems to have a lot of redundancy so far
+- [ ] Move ordering to prioritize searching “interesting” move sequences
+- [ ] Endgame Tablebase for precomputed winning endgame positions
+- [ ] Opening Book for precomputed openings
+- [ ] Only search a couple hundred thousand positions at 4 ply
 
 ## Get the database
 

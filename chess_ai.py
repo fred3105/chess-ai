@@ -1,5 +1,4 @@
 import torch
-from custom_class import ChessBoard
 from train import EvalNet, encode_board
 import chess
 import chess.svg
@@ -28,11 +27,8 @@ class ChessAI:
         self.model.to(device)
         print(f"Chess AI initialized with model on {device}")
 
-    def evaluate_position(self, chess_board):
+    def evaluate_position(self, board):
         """Evaluate a chess position using the trained neural network"""
-        # Convert custom board to chess.Board format for encoding
-        board = self.custom_board_to_chess_board(chess_board)
-
         # Encode the position
         encoded = encode_board(board)
 
@@ -41,69 +37,46 @@ class ChessAI:
             x = torch.tensor(encoded, dtype=torch.float32).unsqueeze(0).to(self.device)
             evaluation = float(self.model(x).item())
 
-        # Return evaluation from current player's perspective
-        return evaluation if chess_board.is_white_to_move() else -evaluation
+        # Convert 0-1 scale to centered evaluation (-1 to 1)
+        # 1 = very favorable for white, 0 = very favorable for black
+        centered_eval = (evaluation - 0.5) * 2
 
-    def custom_board_to_chess_board(self, custom_board):
-        """Convert custom ChessBoard to python-chess Board for evaluation"""
-        board = chess.Board()
-        board.clear_board()
+        # Always return evaluation from white's perspective
+        # Minimax will handle the perspective switching
+        return centered_eval
 
-        # Piece mapping
-        piece_map = {
-            1: chess.PAWN,
-            2: chess.KNIGHT,
-            3: chess.BISHOP,
-            5: chess.ROOK,
-            9: chess.QUEEN,
-            100: chess.KING,
-        }
 
-        # Place pieces on the board
-        for row in range(8):
-            for col in range(8):
-                piece_val = custom_board.board[row, col]
-                if piece_val != 0:
-                    piece_type = piece_map[abs(piece_val)]
-                    color = chess.WHITE if piece_val > 0 else chess.BLACK
-                    square = chess.square(col, row)
-                    board.set_piece_at(square, chess.Piece(piece_type, color))
-
-        # Set turn
-        board.turn = chess.WHITE if custom_board.is_white_to_move() else chess.BLACK
-
-        return board
-
-    def alpha_beta(self, board, depth, alpha, beta, maximizing_player):
+    def alpha_beta(self, board, depth, alpha, beta, is_white_turn):
         """Alpha-beta pruning minimax algorithm"""
         if depth == 0:
-            return self.evaluate_position(board), None
+            eval_score = self.evaluate_position(board)
+            # Return evaluation from current player's perspective
+            return eval_score if is_white_turn else -eval_score, None
 
-        legal_moves = board.generate_legal_moves()
+        legal_moves = list(board.legal_moves)
 
         # Terminal node (no legal moves)
         if not legal_moves:
-            if board.is_king_in_check():
+            if board.is_check():
                 # Checkmate - return very bad score for current player
-                return -10000 + (6 - depth), None  # Prefer faster checkmate
+                return -1000 + depth, None  # Prefer faster checkmate
             else:
                 # Stalemate
                 return 0, None
 
         best_move = None
 
-        if maximizing_player:
+        if is_white_turn:  # White maximizes
             max_eval = float("-inf")
             for move in legal_moves:
                 # Make move
-                captured_piece = board.board[move[2], move[3]]
-                board.make_move(move)
+                board.push(move)
 
                 # Recursive call
                 eval_score, _ = self.alpha_beta(board, depth - 1, alpha, beta, False)
 
                 # Unmake move
-                board.unmake_move(move, captured_piece)
+                board.pop()
 
                 if eval_score > max_eval:
                     max_eval = eval_score
@@ -114,18 +87,17 @@ class ChessAI:
                     break  # Alpha-beta pruning
 
             return max_eval, best_move
-        else:
+        else:  # Black minimizes
             min_eval = float("inf")
             for move in legal_moves:
                 # Make move
-                captured_piece = board.board[move[2], move[3]]
-                board.make_move(move)
+                board.push(move)
 
                 # Recursive call
                 eval_score, _ = self.alpha_beta(board, depth - 1, alpha, beta, True)
 
                 # Unmake move
-                board.unmake_move(move, captured_piece)
+                board.pop()
 
                 if eval_score < min_eval:
                     min_eval = eval_score
@@ -155,7 +127,7 @@ class ChessAI:
                     current_depth,
                     float("-inf"),
                     float("inf"),
-                    board.is_white_to_move(),
+                    board.turn == chess.WHITE,
                 )
 
                 if move is not None:
@@ -164,7 +136,7 @@ class ChessAI:
 
                 elapsed_time = time.time() - start_time
                 print(
-                    f"Depth {current_depth}: Best move {self.move_to_algebraic(best_move)}, "
+                    f"Depth {current_depth}: Best move {best_move}, "
                     f"Score: {best_score:.3f}, Time: {elapsed_time:.2f}s"
                 )
 
@@ -176,22 +148,13 @@ class ChessAI:
 
         return best_move, best_score
 
-    def move_to_algebraic(self, move):
-        """Convert move tuple to algebraic notation"""
-        if move is None:
-            return "None"
-
-        from_row, from_col, to_row, to_col = move
-        from_square = chr(ord("a") + from_col) + str(from_row + 1)
-        to_square = chr(ord("a") + to_col) + str(to_row + 1)
-        return f"{from_square}{to_square}"
 
 class ChessGUI:
     def __init__(self, ai, opponent_color="black", depth=4):
         pygame.init()
         
         self.ai = ai
-        self.board = ChessBoard("")
+        self.board = chess.Board()
         self.opponent_color = opponent_color
         self.depth = depth
         self.selected_square = None
@@ -218,15 +181,6 @@ class ChessGUI:
         self.font = pygame.font.Font(None, 48)
         self.small_font = pygame.font.Font(None, 24)
         
-        # Piece mapping for chess.svg
-        self.piece_mapping = {
-            1: chess.PAWN, -1: chess.PAWN,
-            2: chess.KNIGHT, -2: chess.KNIGHT,
-            3: chess.BISHOP, -3: chess.BISHOP,
-            5: chess.ROOK, -5: chess.ROOK,
-            9: chess.QUEEN, -9: chess.QUEEN,
-            100: chess.KING, -100: chess.KING
-        }
         
         # Cache for piece surfaces
         self.piece_surfaces = {}
@@ -257,21 +211,17 @@ class ChessGUI:
                 if self.selected_square == (row, col):
                     color = self.YELLOW
                 # Highlight possible moves
-                elif (row, col) in [(move[2], move[3]) for move in self.highlighted_moves]:
+                elif (row, col) in [(chess.square_rank(move.to_square), chess.square_file(move.to_square)) for move in self.highlighted_moves]:
                     color = self.GREEN
                 
                 pygame.draw.rect(self.screen, color, (x, y, self.SQUARE_SIZE, self.SQUARE_SIZE))
                 pygame.draw.rect(self.screen, self.BLACK, (x, y, self.SQUARE_SIZE, self.SQUARE_SIZE), 1)
     
-    def get_piece_surface(self, piece_value):
+    def get_piece_surface(self, chess_piece):
         """Get pygame surface for a chess piece using SVG rendering"""
-        if piece_value in self.piece_surfaces:
-            return self.piece_surfaces[piece_value]
-        
-        # Map piece value to chess.Piece
-        piece_type = self.piece_mapping[abs(piece_value)]
-        color = chess.WHITE if piece_value > 0 else chess.BLACK
-        chess_piece = chess.Piece(piece_type, color)
+        piece_key = str(chess_piece)
+        if piece_key in self.piece_surfaces:
+            return self.piece_surfaces[piece_key]
         
         # Generate SVG for the piece
         svg_string = chess.svg.piece(chess_piece, size=self.SQUARE_SIZE - 10)
@@ -280,40 +230,47 @@ class ChessGUI:
             # Convert SVG to PNG bytes using cairosvg
             png_bytes = cairosvg.svg2png(bytestring=svg_string.encode('utf-8'))
             
+            if png_bytes is None:
+                raise Exception("Failed to convert SVG to PNG")
+            
             # Load PNG into PIL Image
             pil_image = Image.open(io.BytesIO(png_bytes))
             
+            # Convert PIL to RGBA if not already
+            if pil_image.mode != 'RGBA':
+                pil_image = pil_image.convert('RGBA')
+            
             # Convert PIL image to pygame surface
-            image_string = pil_image.tobytes()
-            pygame_image = pygame.image.fromstring(image_string, pil_image.size, pil_image.mode)
+            pygame_image = pygame.image.fromstring(pil_image.tobytes(), pil_image.size, 'RGBA')
             
             # Cache the surface
-            self.piece_surfaces[piece_value] = pygame_image
+            self.piece_surfaces[piece_key] = pygame_image
             return pygame_image
             
         except Exception:
             # Fallback to simple colored rectangle if SVG rendering fails
             surface = pygame.Surface((self.SQUARE_SIZE - 10, self.SQUARE_SIZE - 10))
-            color = (255, 255, 255) if piece_value > 0 else (0, 0, 0)
+            color = (255, 255, 255) if chess_piece.color == chess.WHITE else (0, 0, 0)
             surface.fill(color)
-            self.piece_surfaces[piece_value] = surface
+            self.piece_surfaces[piece_key] = surface
             return surface
     
     def draw_pieces(self):
         """Draw chess pieces using SVG rendering"""
-        for row in range(8):
-            for col in range(8):
-                piece = self.board.board[row, col]
-                if piece != 0:
-                    x = col * self.SQUARE_SIZE + 20 + 5  # 5px margin
-                    y = (7-row) * self.SQUARE_SIZE + 20 + 5  # 5px margin
-                    
-                    piece_surface = self.get_piece_surface(piece)
-                    self.screen.blit(piece_surface, (x, y))
+        for square in chess.SQUARES:
+            piece = self.board.piece_at(square)
+            if piece:
+                col = chess.square_file(square)
+                row = chess.square_rank(square)
+                x = col * self.SQUARE_SIZE + 20 + 5  # 5px margin
+                y = (7-row) * self.SQUARE_SIZE + 20 + 5  # 5px margin
+                
+                piece_surface = self.get_piece_surface(piece)
+                self.screen.blit(piece_surface, (x, y))
     
     def draw_status(self):
         """Draw game status"""
-        current_player = "White" if self.board.is_white_to_move() else "Black"
+        current_player = "White" if self.board.turn == chess.WHITE else "Black"
         
         if self.ai_thinking:
             status_text = "AI thinking..."
@@ -340,27 +297,36 @@ class ChessGUI:
         if row < 0 or row > 7 or col < 0 or col > 7:
             return
         
-        legal_moves = self.board.generate_legal_moves()
+        legal_moves = list(self.board.legal_moves)
         
         # If no square selected, select this square if it has a piece
         if self.selected_square is None:
-            piece = self.board.board[row, col]
-            if piece != 0:
+            square = chess.square(col, row)
+            piece = self.board.piece_at(square)
+            if piece:
                 # Check if it's the right color's turn
-                is_white_piece = piece > 0
-                if is_white_piece == self.board.is_white_to_move():
+                if piece.color == self.board.turn:
                     self.selected_square = (row, col)
                     # Highlight possible moves from this square
+                    from_square = chess.square(col, row)
                     self.highlighted_moves = [move for move in legal_moves 
-                                            if move[0] == row and move[1] == col]
+                                            if move.from_square == from_square]
         else:
             # Try to move to clicked square
             from_row, from_col = self.selected_square
-            move = (from_row, from_col, row, col)
+            from_square = chess.square(from_col, from_row)
+            to_square = chess.square(col, row)
             
-            if move in legal_moves:
+            # Find the matching move from legal moves
+            matching_move = None
+            for move in legal_moves:
+                if move.from_square == from_square and move.to_square == to_square:
+                    matching_move = move
+                    break
+            
+            if matching_move:
                 # Valid move
-                self.board.make_move(move)
+                self.board.push(matching_move)
                 self.selected_square = None
                 self.highlighted_moves = []
                 
@@ -372,13 +338,14 @@ class ChessGUI:
                 self.ai_move_timer = pygame.time.get_ticks() + 500  # 0.5 second delay
             else:
                 # Invalid move or selecting new piece
-                piece = self.board.board[row, col]
-                if piece != 0:
-                    is_white_piece = piece > 0
-                    if is_white_piece == self.board.is_white_to_move():
+                square = chess.square(col, row)
+                piece = self.board.piece_at(square)
+                if piece:
+                    if piece.color == self.board.turn:
                         self.selected_square = (row, col)
+                        from_square = chess.square(col, row)
                         self.highlighted_moves = [move for move in legal_moves 
-                                                if move[0] == row and move[1] == col]
+                                                if move.from_square == from_square]
                 else:
                     self.selected_square = None
                     self.highlighted_moves = []
@@ -392,27 +359,34 @@ class ChessGUI:
         ai_move, score = self.ai.get_best_move(self.board, depth=self.depth, time_limit=5.0)
         
         if ai_move:
-            self.board.make_move(ai_move)
-            print(f"AI plays: {self.ai.move_to_algebraic(ai_move)} (Score: {score:.3f})")
+            self.board.push(ai_move)
+            print(f"AI plays: {ai_move} (Score: {score:.3f})")
         
         self.ai_thinking = False
         self.check_game_end()
     
     def is_ai_turn(self):
         """Check if it's AI's turn"""
-        return ((self.board.is_white_to_move() and self.opponent_color == "black") or
-                (not self.board.is_white_to_move() and self.opponent_color == "white"))
+        return ((self.board.turn == chess.WHITE and self.opponent_color == "black") or
+                (self.board.turn == chess.BLACK and self.opponent_color == "white"))
     
     def check_game_end(self):
         """Check if game has ended"""
-        legal_moves = self.board.generate_legal_moves()
-        
-        if not legal_moves:
-            if self.board.is_king_in_check():
-                winner = "Black" if self.board.is_white_to_move() else "White"
-                print(f"Checkmate! {winner} wins!")
-            else:
-                print("Stalemate! Draw!")
+        if self.board.is_checkmate():
+            winner = "Black" if self.board.turn == chess.WHITE else "White"
+            print(f"Checkmate! {winner} wins!")
+            return True
+        elif self.board.is_stalemate():
+            print("Stalemate! Draw!")
+            return True
+        elif self.board.is_insufficient_material():
+            print("Draw by insufficient material!")
+            return True
+        elif self.board.is_seventyfive_moves():
+            print("Draw by 75-move rule!")
+            return True
+        elif self.board.is_fivefold_repetition():
+            print("Draw by fivefold repetition!")
             return True
         return False
     
