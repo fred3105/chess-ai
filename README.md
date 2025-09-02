@@ -6,7 +6,6 @@ There is available code to load PGN games
 
 ## TODO
 
-- [ ] Replace chess package with custom class
 - [ ] Make chess AI available online
 - [ ] Create openings dataset to train on openings
 - [ ] Create endgames dataset to train on endings

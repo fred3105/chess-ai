@@ -46,7 +46,7 @@ def encode_board(board):
     for square, piece in piece_map.items():
         planes[PIECE_TO_IDX[piece.symbol()], square] = 1.0
 
-    return planes.reshape(8, 8, 12)  # shape (8, 8, 12)
+    return planes.reshape(8, 8, 12)
 
 
 # -------------------------
