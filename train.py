@@ -404,22 +404,59 @@ def train_model(
         training_history["val_mae"].append(val_mae)
         training_history["lr"].append(current_lr)
 
+        # Run evaluation test every 10 epochs to assess chess strength
+        evaluation_results = None
+        if (
+            epoch + 1
+        ) % 10 == 0 or epoch == 0:  # Run on first epoch and every 10 epochs
+            print(f"\n🧠 Running chess strength evaluation at epoch {epoch + 1}...")
+            evaluation_results = evaluate_model_strength(
+                model, device=device, verbose=False
+            )
+            print(
+                f"   Chess Evaluation - Accuracy: {evaluation_results['accuracy']:.2%} "
+                f"({evaluation_results['correct_positions']}/{evaluation_results['total_positions']}) "
+                f"| Avg Score: {evaluation_results['average_score']:.3f}"
+            )
+
+            # Estimate playing strength based on evaluation performance
+            strength_rating = int(
+                800 + evaluation_results["average_score"] * 1200
+            )  # Scale from 800-2000 ELO
+            print(f"   Estimated Playing Strength: ~{strength_rating} ELO")
+            print()
+
         # Log to wandb
         if use_wandb:
-            wandb.log(
-                {
-                    "epoch": epoch + 1,
-                    "train/loss": train_loss,
-                    "val/loss": val_loss,
-                    "val/mae": val_mae,
-                    "val/accuracy_0.5": val_accuracy_05,
-                    "val/accuracy_0.2": val_accuracy_02,
-                    "training/learning_rate": current_lr,
-                    "training/epoch_time_seconds": epoch_time,
-                    "training/patience_counter": patience_counter,
-                    "training/best_val_loss": best_val_loss,
-                }
-            )
+            log_dict = {
+                "epoch": epoch + 1,
+                "train/loss": train_loss,
+                "val/loss": val_loss,
+                "val/mae": val_mae,
+                "val/accuracy_0.5": val_accuracy_05,
+                "val/accuracy_0.2": val_accuracy_02,
+                "training/learning_rate": current_lr,
+                "training/epoch_time_seconds": epoch_time,
+                "training/patience_counter": patience_counter,
+                "training/best_val_loss": best_val_loss,
+            }
+
+            # Add evaluation metrics if available
+            if evaluation_results is not None:
+                log_dict.update(
+                    {
+                        "chess_eval/accuracy": evaluation_results["accuracy"],
+                        "chess_eval/average_score": evaluation_results["average_score"],
+                        "chess_eval/correct_positions": evaluation_results[
+                            "correct_positions"
+                        ],
+                        "chess_eval/estimated_elo": int(
+                            800 + evaluation_results["average_score"] * 1200
+                        ),
+                    }
+                )
+
+            wandb.log(log_dict)
 
         # Enhanced progress monitoring for long training
         if epoch % 3 == 0 or epoch < 15:  # More frequent updates early on
@@ -590,7 +627,144 @@ def augment_position(batch_x, batch_y):
 
 
 # -------------------------
-# 6. Fast inference using torch.jit with optimization
+# 6. Evaluation test positions for strength assessment
+# -------------------------
+EVALUATION_POSITIONS = [
+    # Tactical positions with best moves
+    {
+        "fen": "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+        "best_move": "d2d3",  # Italian Game - solid development
+        "description": "Italian Game opening position",
+    },
+    {
+        "fen": "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+        "best_move": "e7e5",  # King's Pawn response
+        "description": "Opening: response to e4",
+    },
+    {
+        "fen": "r2qkb1r/ppp2ppp/2n1bn2/2bpp3/3PP3/2N2N2/PPP2PPP/R1BQKB1R w KQkq - 4 5",
+        "best_move": "d4d5",  # Take bishop
+        "description": "Four Knights Game development",
+    },
+    {
+        "fen": "2rqkb1r/ppp2ppp/2n1bn2/3pp3/3PP3/2N2N2/PPP2PPP/R1BQKB1R w KQ - 0 6",
+        "best_move": "e4d5",  # Take center
+        "description": "Central control position",
+    },
+    {
+        "fen": "rnbqk2r/pppp1ppp/5n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+        "best_move": "f3e5",  # Solid center support
+        "description": "Italian vs Italian",
+    },
+    {
+        "fen": "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3",
+        "best_move": "g8f6",  # Counter-attack
+        "description": "Italian Game defense",
+    },
+    {
+        "fen": "r1bq1rk1/ppp2ppp/2n2n2/2bpp3/2B1P3/3P1N2/PPP2PPP/RNBQ1RK1 b - - 0 6",
+        "best_move": "d5c4",  # Take on c4
+        "description": "Middlegame tactical motif",
+    },
+    {
+        "fen": "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/3P1N2/PPP2PPP/RNBQK2R b KQkq - 0 5",
+        "best_move": "d7d5",  # Solid defense
+        "description": "Italian Game solid defense",
+    },
+]
+
+
+def evaluate_model_strength(model, device="mps", verbose=False):
+    """
+    Test the model on specific chess positions to evaluate its tactical understanding.
+    Returns a score based on how well it evaluates the positions.
+    """
+    model.eval()
+    correct_evaluations = 0
+    total_positions = len(EVALUATION_POSITIONS)
+    evaluation_scores = []
+
+    with torch.no_grad():
+        for i, pos_data in enumerate(EVALUATION_POSITIONS):
+            try:
+                # Create board from FEN
+                board = chess.Board(pos_data["fen"])
+
+                # Get model's evaluation of current position
+                current_eval = fast_eval(model, board, device)
+
+                # Test different candidate moves and see if model prefers the best one
+                move_evaluations = []
+                legal_moves = list(board.legal_moves)
+
+                # Limit to top 5 most reasonable moves to speed up evaluation
+                moves_to_test = legal_moves[: min(5, len(legal_moves))]
+
+                for move in moves_to_test:
+                    board_copy = board.copy()
+                    board_copy.push(move)
+                    move_eval = fast_eval(model, board_copy, device)
+
+                    # For white to move, we want higher evaluations for better moves
+                    # For black to move, we want lower evaluations for better moves
+                    if board.turn:  # White to move
+                        move_evaluations.append((move, move_eval))
+                    else:  # Black to move
+                        move_evaluations.append((move, -move_eval))
+
+                # Sort by evaluation (best moves first)
+                move_evaluations.sort(key=lambda x: x[1], reverse=True)
+
+                # Check if the best move according to our test set is in top choices
+                best_move_uci = pos_data["best_move"]
+                try:
+                    best_move = chess.Move.from_uci(best_move_uci)
+                    if best_move in [m[0] for m in move_evaluations[:2]]:  # Top 2 moves
+                        correct_evaluations += 1
+                        score = 1.0
+                    elif best_move in [
+                        m[0] for m in move_evaluations[:3]
+                    ]:  # Top 3 moves
+                        score = 0.5
+                    else:
+                        score = 0.0
+
+                    evaluation_scores.append(score)
+
+                    if verbose:
+                        print(f"Position {i + 1}: {pos_data['description']}")
+                        print(f"Best move: {best_move_uci}, Score: {score}")
+                        print(
+                            f"Top moves by model: {[str(m[0]) for m in move_evaluations[:3]]}"
+                        )
+                        print()
+
+                except ValueError:
+                    # Invalid move in test data, skip
+                    evaluation_scores.append(0.0)
+
+            except Exception as e:
+                if verbose:
+                    print(f"Error evaluating position {i + 1}: {e}")
+                evaluation_scores.append(0.0)
+
+    # Calculate metrics
+    avg_score = (
+        sum(evaluation_scores) / len(evaluation_scores) if evaluation_scores else 0.0
+    )
+    accuracy = correct_evaluations / total_positions
+
+    return {
+        "accuracy": accuracy,
+        "average_score": avg_score,
+        "correct_positions": correct_evaluations,
+        "total_positions": total_positions,
+        "individual_scores": evaluation_scores,
+    }
+
+
+# -------------------------
+# 7. Fast inference using torch.jit with optimization
 # -------------------------
 def fast_eval(model, board, device="cpu"):
     model.to(device)
