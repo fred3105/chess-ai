@@ -554,11 +554,11 @@ def train_model(
 # -------------------------
 # 5. PGN parser pipeline -> .npz files
 # -------------------------
-def parse_pgn_folder(pgn_folder, output_file):
+def parse_pgn_folder(pgn_folder, output_file, fetch_only_n_first_moves=None):
     positions = []
     labels = []
 
-    max_games = 5000000
+    max_games = 200000
 
     for filename in os.listdir(pgn_folder):
         if not filename.endswith(".pgn"):
@@ -582,7 +582,10 @@ def parse_pgn_folder(pgn_folder, output_file):
                     board.push(move)
                     positions.append(encode_board(board))
                     labels.append(outcome)
-                    if len(positions) >= max_games:
+                    if len(positions) >= max_games and (
+                        fetch_only_n_first_moves is None
+                        or len(positions) <= fetch_only_n_first_moves
+                    ):
                         break
                 if len(positions) >= max_games:
                     break
@@ -776,9 +779,10 @@ def fast_eval_batch(model, boards, device="mps"):
 if __name__ == "__main__":
     # Parse PGNs into .npz dataset, only need to do this once
     # parse_pgn_folder("data", "chess_dataset.npz")
+    parse_pgn_folder("data", "chess_openings.npz")
 
     # Load dataset
-    data = np.load("chess_dataset.npz")
+    data = np.load("chess_openings.npz")
     positions = data["positions"]
     labels = data["labels"]
 
@@ -870,16 +874,6 @@ if __name__ == "__main__":
             "🚀 Massive dataset size (>20M positions). Should achieve grandmaster-level evaluation!"
         )
 
-    print(
-        f"Estimated training time: {len(positions) / 80000 * 1.0:.1f}-{len(positions) / 80000 * 1.5:.1f} hours on M3 Pro"
-    )
-    print(
-        f"Batch size optimized for M3 Pro: {train_loader.batch_size} (training) / {val_loader.batch_size} (validation)"
-    )
-    print(
-        "🔥 Advanced optimizations active: Multi-strategy augmentation, L1 regularization, extended schedules"
-    )
-
     history = train_model(
         train_loader,
         val_loader,
@@ -945,11 +939,10 @@ if __name__ == "__main__":
         print(f"\n⚠️  Model achieves {best_throughput:,.0f} evals/second (target: 10k+)")
         print("   Consider reducing model size if speed is critical.")
 
-    print(f"\n📈 TRAINING SUMMARY:")
+    print("\n📈 TRAINING SUMMARY:")
     print(f"   • Final validation loss: {history['val_loss'][-1]:.4f}")
     print(f"   • Final validation MAE: {history['val_mae'][-1]:.4f}")
     print(f"   • Training epochs completed: {len(history['train_loss'])}")
-    print(f"   • Model will be strongest with more diverse, high-quality games")
 
     # Log final performance metrics to wandb
     if best_throughput >= 10000:

@@ -7,7 +7,9 @@ There is available code to load PGN games
 ## TODO
 
 - [ ] Replace chess package with custom class
-- [ ] Implement min max algorithm to create the chess AI and play with it
+- [ ] Make chess AI available online
+- [ ] Create openings dataset to train on openings
+- [ ] Create endgames dataset to train on endings
 - [ ] Look into selecting better positions for training, seems to have a lot of redundancy so far
 
 ## Get the database
