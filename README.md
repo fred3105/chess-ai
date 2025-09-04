@@ -1,15 +1,13 @@
-# NNUE Chess AI - Grandmaster Training
+# C++ Chess AI Engine
 
-High-performance NNUE (Efficiently Updatable Neural Network) chess evaluation trained on your Lichess Elite grandmaster game collection with perfect **50/50 balance** between quiet and complex positions.
+High-performance chess AI using ONNX Runtime for fast NNUE (Efficiently Updatable Neural Network) evaluation with C++ optimizations.
 
 ## 🎯 Features
 
-- **Balanced Training**: Exactly 50% quiet positions, 50% complex (tactical/imbalanced/unusual)
-- **Elite Dataset**: Your 79 Lichess Elite PGN files (2200+ ELO, 2013-2020)
-- **Efficient Architecture**: 40,960 HalfKP features, 10.5M parameters
-- **M3 Pro Optimized**: MPS acceleration, optimized batch sizes
-- **Wandb Integration**: Complete training tracking and visualization
-- **Clean Codebase**: Modern Python, type hints, proper error handling
+- **C++ Optimized**: Fast search algorithms with position caching
+- **ONNX Runtime**: Efficient neural network evaluation
+- **NNUE Architecture**: 40,960 HalfKP features, 10.5M parameters  
+- **Interactive GUI**: Pygame-based chess interface
 
 ## 🚀 Quick Start
 
@@ -18,85 +16,48 @@ High-performance NNUE (Efficiently Updatable Neural Network) chess evaluation tr
 ```bash
 # Install dependencies with uv
 uv sync
+
+# Build C++ extension
+cd cpp_search && python setup.py build_ext --inplace
 ```
 
-### Training
+### Playing Chess
 
 ```bash
-# Standard training (100k positions, 50 epochs)
-uv run train.py
-
-# Custom training
-uv run train.py \
-    --train-size 1000000 \
-    --val-size 10000 \
-    --epochs 100 \
-    --quiet-ratio 0.5 \
-    --wandb-project my-chess-nnue
-
-# Quick test run
-python train.py \
-    --train-size 10000 \
-    --val-size 2000 \
-    --epochs 10 \
-    --batch-size 2048
+# Start the chess GUI
+uv run chess_ai.py
 ```
 
-## 📊 Dataset Balance
-
-Your system automatically ensures perfect distribution:
-
-- **Quiet (50%)**: Positional play, no tactics, balanced material
-- **Complex (50%)**:
-  - **Tactical**: Checks, captures, immediate threats
-  - **Imbalanced**: Material differences >3 pawns
-  - **Unusual**: Endgames, promoted pieces, rare patterns
+Choose your color (white/black) and search depth (1-8). The AI uses:
+- C++ optimized search algorithms
+- Position evaluation caching 
+- Smart move ordering
+- Alpha-beta pruning with iterative deepening
 
 ## 🏗️ Architecture
 
 ```
-Input: HalfKP Features (40,960 dimensions)
+C++ Search Engine
   ↓
-Feature Transformer (256 hidden)
+ONNX Runtime Evaluation
   ↓
-L1 Layer (32 hidden) + ClippedReLU
+NNUE Model (40,960 HalfKP features)
   ↓
-L2 Layer (32 hidden) + ClippedReLU
-  ↓
-Output (1 value, centipawns)
+Position Score (centipawns)
 ```
 
-## 📈 Wandb Integration
+## 🔧 Components
 
-All training metrics automatically logged:
+- **`cpp_fast_chess_ai.py`**: Main chess AI engine with C++ optimizations
+- **`chess_ai.py`**: Interactive GUI using pygame
+- **`cpp_search/`**: C++ extension for fast search algorithms  
+- **`nnue_model.py`**: Neural network model definitions
+- **`checkpoints/`**: Trained model files
 
-- Training/validation loss curves
-- Learning rate scheduling
-- Model gradients and parameters
-- Dataset distribution statistics
-- Hardware utilization
+## ⚡ Performance
 
-## 💡 Usage Examples
-
-```bash
-# Research run - small, fast
-uv run train.py --train-size 25000 --epochs 20
-
-# Production run - large, comprehensive
-uv run train.py --train-size 1000000 --epochs 100
-
-# Balanced experiment - test different ratios
-uv run train.py --quiet-ratio 0.3  # 30% quiet, 70% complex
-uv run train.py --quiet-ratio 0.7  # 70% quiet, 30% complex
-
-# Hardware optimization
-uv run train.py --batch-size 8192 --num-workers 6  # More parallel
-uv run train.py --batch-size 2048 --num-workers 2  # Less memory
-```
-
-## ✅ System Requirements
-
-- **Hardware**: Apple Silicon (M1/M2/M3) recommended
-- **Memory**: 8GB+ RAM for large datasets
-- **Storage**: 5GB+ for checkpoints and data
-- **Python**: 3.10+
+The C++ implementation provides significant speedups:
+- Position caching for repeated evaluations
+- Efficient alpha-beta search
+- ONNX Runtime optimization
+- Batch evaluation for move ordering

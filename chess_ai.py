@@ -1,195 +1,10 @@
 import io
-import time
 
 import cairosvg
 import chess
 import chess.svg
-import numpy as np
 import pygame
-import torch
 from PIL import Image
-
-from nnue_model import HalfKPFeatureExtractor, create_nnue_model
-
-
-class ChessAI:
-    def __init__(self, model_path="checkpoints/best_model.pth", device="mps"):
-        """Initialize the Chess AI with trained NNUE evaluation function"""
-        self.device = device
-
-        # Create NNUE model
-        self.model = create_nnue_model()
-
-        # Load trained weights
-        checkpoint = torch.load(model_path, map_location=device)
-        if "model_state_dict" in checkpoint:
-            self.model.load_state_dict(checkpoint["model_state_dict"])
-        else:
-            self.model.load_state_dict(checkpoint)
-
-        self.model.to(device)
-        self.model.eval()  # Set to evaluation mode
-
-        # Initialize feature extractor
-        self.feature_extractor = HalfKPFeatureExtractor()
-
-        print(f"Chess AI initialized with NNUE model on {device}")
-
-    def _board_to_array(self, board: chess.Board) -> np.ndarray:
-        """Convert chess board to 8x8 numpy array for NNUE feature extraction"""
-        array = np.zeros((8, 8), dtype=np.int8)
-
-        piece_values = {
-            chess.PAWN: 1,
-            chess.KNIGHT: 2,
-            chess.BISHOP: 3,
-            chess.ROOK: 4,
-            chess.QUEEN: 5,
-            chess.KING: 6,
-        }
-
-        for square in chess.SQUARES:
-            piece = board.piece_at(square)
-            if piece:
-                row, col = divmod(square, 8)
-                value = piece_values[piece.piece_type]
-                if not piece.color:  # Black pieces negative
-                    value = -value
-                array[7 - row, col] = value  # Flip row for correct orientation
-
-        return array
-
-    def evaluate_position(self, board):
-        """Evaluate a chess position using the trained NNUE model"""
-        # Convert board to numpy array
-        board_array = self._board_to_array(board)
-
-        # Find king squares
-        white_king_sq = board.king(chess.WHITE)
-        black_king_sq = board.king(chess.BLACK)
-
-        if white_king_sq is None or black_king_sq is None:
-            # Invalid position - return neutral evaluation
-            return 0.0
-
-        # Extract HalfKP features
-        white_features, black_features = self.feature_extractor.extract_halfkp_features(
-            board_array, white_king_sq, black_king_sq
-        )
-
-        # Get evaluation from NNUE model
-        with torch.no_grad():
-            white_features = white_features.unsqueeze(0).to(self.device)
-            black_features = black_features.unsqueeze(0).to(self.device)
-            evaluation_cp = float(self.model(white_features, black_features).item())
-
-        # Convert centipawns to normalized scale for alpha-beta search
-        # Clamp extreme values and normalize to reasonable range
-        evaluation_cp = max(-3000, min(3000, evaluation_cp))
-        normalized_eval = evaluation_cp / 100.0  # Convert to "pawn units"
-        # NNUE returns evaluation from White's perspective (positive = good for White)
-        # No need to adjust based on turn - minimax handles perspective
-
-        return normalized_eval
-
-    def alpha_beta(
-        self,
-        board: chess.Board,
-        depth: int,
-        alpha: float,
-        beta: float,
-    ):
-        """Alpha-beta pruning minimax algorithm"""
-        if depth == 0:
-            eval_score = self.evaluate_position(board)
-            return eval_score, None
-
-        legal_moves = list(board.legal_moves)
-
-        # Terminal node (no legal moves)
-        if not legal_moves:
-            if board.is_check():
-                # Checkmate - return score based on who's checkmated
-                if board.turn == chess.WHITE:  # White is checkmated
-                    return -1000 + depth, None  # Very bad for White
-                else:  # Black is checkmated
-                    return 1000 - depth, None  # Very good for White
-            else:
-                # Stalemate
-                return 0, None
-
-        best_move = None
-
-        if board.turn == chess.WHITE:  # White maximizes
-            max_eval = float("-inf")
-            for move in legal_moves:
-                board.push(move)
-                eval_score, _ = self.alpha_beta(board, depth - 1, alpha, beta)
-                board.pop()
-
-                if eval_score > max_eval:
-                    max_eval = eval_score
-                    best_move = move
-
-                alpha = max(alpha, eval_score)
-                if beta <= alpha:
-                    break
-
-            return max_eval, best_move
-        else:  # Black minimizes
-            min_eval = float("inf")
-            for move in legal_moves:
-                board.push(move)
-                eval_score, _ = self.alpha_beta(board, depth - 1, alpha, beta)
-                board.pop()
-
-                if eval_score < min_eval:
-                    min_eval = eval_score
-                    best_move = move
-
-                beta = min(beta, eval_score)
-                if beta <= alpha:
-                    break
-
-            return min_eval, best_move
-
-    def get_best_move(self, board, depth=4, time_limit=None):
-        """Get the best move using alpha-beta search with optional time limit"""
-        start_time = time.time()
-
-        # Iterative deepening
-        best_move = None
-        best_score = None
-
-        for current_depth in range(1, depth + 1):
-            if time_limit and (time.time() - start_time) > time_limit:
-                break
-
-            try:
-                score, move = self.alpha_beta(
-                    board,
-                    current_depth,
-                    float("-inf"),
-                    float("inf"),
-                )
-
-                if move is not None:
-                    best_move = move
-                    best_score = score
-
-                elapsed_time = time.time() - start_time
-                print(
-                    f"Depth {current_depth}: Best move {best_move}, "
-                    f"Score: {best_score:.3f}, Time: {elapsed_time:.2f}s"
-                )
-
-                if time_limit and elapsed_time > time_limit * 0.8:
-                    break
-
-            except KeyboardInterrupt:
-                break
-
-        return best_move, best_score
 
 
 class ChessGUI:
@@ -207,7 +22,7 @@ class ChessGUI:
         self.SQUARE_SIZE = 70
         self.BOARD_SIZE = self.SQUARE_SIZE * 8
         self.WINDOW_WIDTH = self.BOARD_SIZE + 40
-        self.WINDOW_HEIGHT = self.BOARD_SIZE + 100
+        self.WINDOW_HEIGHT = self.BOARD_SIZE + 120
 
         self.screen = pygame.display.set_mode((self.WINDOW_WIDTH, self.WINDOW_HEIGHT))
         pygame.display.set_caption("Chess AI")
@@ -339,6 +154,13 @@ class ChessGUI:
         text_surface = self.small_font.render(status_text, True, self.BLACK)
         self.screen.blit(text_surface, (20, self.BOARD_SIZE + 30))
 
+        # Show evaluation mode if available
+        if hasattr(self.ai, "get_evaluation_mode"):
+            eval_mode = self.ai.get_evaluation_mode()
+            eval_text = f"Evaluation: {eval_mode} (Press 'E' to toggle)"
+            eval_surface = self.small_font.render(eval_text, True, self.BLACK)
+            self.screen.blit(eval_surface, (20, self.BOARD_SIZE + 50))
+
     def handle_click(self, pos):
         """Handle mouse clicks"""
         if self.is_ai_turn() or self.ai_thinking:
@@ -465,6 +287,19 @@ class ChessGUI:
                     self.running = False
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     self.handle_click(event.pos)
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_e and hasattr(
+                        self.ai, "set_evaluation_mode"
+                    ):
+                        # Toggle evaluation mode with 'E' key
+                        current_mode = self.ai.get_evaluation_mode()
+                        new_mode = (
+                            "NNUE"
+                            if current_mode == "Deterministic"
+                            else "Deterministic"
+                        )
+                        self.ai.set_evaluation_mode(new_mode.lower())
+                        print(f"Switched to {self.ai.get_evaluation_mode()} evaluation")
 
             # AI move timing
             if (
@@ -489,24 +324,34 @@ class ChessGUI:
 
 
 if __name__ == "__main__":
-    # Initialize the Chess AI
-    ai = ChessAI(device="cpu")
-
-    # Simple command line setup for now
     print("Welcome to Chess AI!")
+
+    # Choose evaluation mode
+    print("Choose evaluation mode:")
+    print("1. Deterministic (ultra-fast classical evaluation)")
+    print("2. NNUE (your trained neural network)")
+
+    eval_choice = input("Select evaluation mode (1-2) [1]: ").strip()
+
+    if eval_choice == "2":
+        # Use NNUE evaluation
+        from hybrid_chess_ai import HybridChessAI
+
+        ai = HybridChessAI(evaluation_mode="nnue")
+        depth = 3  # NNUE is slower but stronger
+        print(f"Using {ai.get_evaluation_mode()} evaluation")
+    else:
+        from hybrid_chess_ai import HybridChessAI
+
+        ai = HybridChessAI(evaluation_mode="deterministic")
+        depth = 9
+        print(f"Using {ai.get_evaluation_mode()} evaluation")
+
+    # Game setup
     human_color = input("Choose your color (white/black) [white]: ").strip().lower()
     if human_color not in ["white", "black"]:
         human_color = "white"
 
-    try:
-        depth = int(input("Choose AI depth (0-3) [1]: ") or 1)
-        if depth < 0 or depth > 3:
-            depth = 1
-        # Convert to odd depth to avoid evaluation perspective issues
-        odd_depth = depth * 2 + 1
-    except ValueError:
-        odd_depth = 3
-
     # Start the chess GUI
-    gui = ChessGUI(ai, human_color=human_color, depth=odd_depth)
+    gui = ChessGUI(ai, human_color=human_color, depth=depth)
     gui.run()

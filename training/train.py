@@ -109,7 +109,7 @@ class NNUETrainer:
                     }
                 )
 
-        # Normalize by dataset size instead of number of batches  
+        # Normalize by dataset size instead of number of batches
         return total_loss / len(self.train_loader.dataset)
 
     def validate(self) -> float:
@@ -155,7 +155,7 @@ class NNUETrainer:
     def train(
         self,
         num_epochs: int,
-        checkpoint_dir: str = "checkpoints",
+        checkpoint_dir: str = "../checkpoints",
         save_every: int = 5,
         early_stopping_patience: int = 15,
     ):
@@ -306,9 +306,10 @@ def main():
 
     # Get PGN files from data directory
     import glob
+
     pgn_files = glob.glob("data/*.pgn")
     logger.info(f"Found {len(pgn_files)} PGN files")
-    
+
     # Create datasets
     logger.info("Creating balanced datasets from grandmaster games...")
     train_dataset, val_dataset = create_balanced_datasets(

@@ -10,12 +10,21 @@ dependencies = [
     "torch>=2.8.0",
     "wandb>=0.21.3",
     "tqdm>=4.64.0",
+    "onnx>=1.15.0",
+    "onnxruntime>=1.16.0",
+    "cairosvg>=2.7.0",
+    "pillow>=10.0.0",
+    "pygame>=2.5.0",
+    "pybind11>=2.10.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "ruff>=0.1.0",
     "mypy>=1.0.0",
+]
+cpp = [
+    "pybind11>=2.10.0",
 ]
 
 [tool.ruff]
