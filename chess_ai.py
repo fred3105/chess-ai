@@ -299,7 +299,6 @@ class ChessGUI:
                             else "Deterministic"
                         )
                         self.ai.set_evaluation_mode(new_mode.lower())
-                        print(f"Switched to {self.ai.get_evaluation_mode()} evaluation")
 
             # AI move timing
             if (
@@ -334,18 +333,16 @@ if __name__ == "__main__":
     eval_choice = input("Select evaluation mode (1-2) [1]: ").strip()
 
     if eval_choice == "2":
-        # Use NNUE evaluation
-        from hybrid_chess_ai import HybridChessAI
+        # Use NNUE evaluation with pure C++
+        from pure_cpp_chess_ai import PureCppChessAI
 
-        ai = HybridChessAI(evaluation_mode="nnue")
-        depth = 3  # NNUE is slower but stronger
-        print(f"Using {ai.get_evaluation_mode()} evaluation")
+        ai = PureCppChessAI(evaluation_mode="nnue")
+        depth = 5
     else:
-        from hybrid_chess_ai import HybridChessAI
+        from pure_cpp_chess_ai import PureCppChessAI
 
-        ai = HybridChessAI(evaluation_mode="deterministic")
+        ai = PureCppChessAI(evaluation_mode="deterministic")
         depth = 9
-        print(f"Using {ai.get_evaluation_mode()} evaluation")
 
     # Game setup
     human_color = input("Choose your color (white/black) [white]: ").strip().lower()
