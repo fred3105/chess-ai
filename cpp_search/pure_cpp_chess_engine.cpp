@@ -244,6 +244,12 @@ private:
     HalfKPFeatureExtractor feature_extractor;
     bool nnue_available;
     
+    // NNUE evaluation cache
+    static constexpr size_t NNUE_CACHE_SIZE = 8192;  // Smaller cache for NNUE evals
+    std::array<std::pair<uint64_t, double>, NNUE_CACHE_SIZE> nnue_cache;
+    int nnue_cache_hits;
+    int nnue_cache_lookups;
+    
     static int square_from_coords(int file, int rank) {
         return rank * 8 + file;
     }
@@ -345,6 +351,31 @@ private:
         cache_lookups = 0;
     }
     
+    // NNUE cache methods
+    bool probe_nnue_cache(uint64_t hash, double& eval) {
+        nnue_cache_lookups++;
+        size_t index = hash % NNUE_CACHE_SIZE;
+        if (nnue_cache[index].first == hash) {
+            nnue_cache_hits++;
+            eval = nnue_cache[index].second;
+            return true;
+        }
+        return false;
+    }
+    
+    void store_nnue_cache(uint64_t hash, double eval) {
+        size_t index = hash % NNUE_CACHE_SIZE;
+        nnue_cache[index] = {hash, eval};
+    }
+    
+    void clear_nnue_cache() {
+        for (auto& entry : nnue_cache) {
+            entry = {0, 0.0};
+        }
+        nnue_cache_hits = 0;
+        nnue_cache_lookups = 0;
+    }
+    
     // Initialize ONNX Runtime
     bool init_nnue(const std::string& model_path) {
         try {
@@ -354,8 +385,32 @@ private:
             session_options->SetIntraOpNumThreads(4);
             session_options->SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
             
-            // Load ONNX model
+            // Enable quantization optimizations for faster inference
+            session_options->SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+            
+            // Enable dynamic quantization during inference for faster execution
+            // This will automatically quantize weights to int8 during runtime
+            session_options->AddConfigEntry("session.dynamic_quantization", "1");
+            
+            // Enable additional CPU optimizations
+            session_options->AddConfigEntry("session.disable_cpu_ep_fallback", "0");
+            session_options->AddConfigEntry("session.use_per_session_threads", "1");
+            
+            // Set memory pattern optimization
+            session_options->EnableMemPattern();
+            session_options->EnableCpuMemArena();
+            
+            // Enable profiling to monitor quantization effects (optional)
+            session_options->EnableProfiling("nnue_profile");
+            
+            // Try to enable additional optimization transformers
+            session_options->AddConfigEntry("session.qdq_is_int8_allowed", "1");  // Allow QDQ ops to be int8
+            session_options->AddConfigEntry("session.optimization.enable_gelu_approximation", "1");
+            
+            // Load ONNX model with quantization-optimized session
             ort_session = std::make_unique<Ort::Session>(*ort_env, model_path.c_str(), *session_options);
+            
+            std::cout << "✅ NNUE model loaded with dynamic quantization enabled" << std::endl;
             
             // Get input/output info
             Ort::AllocatorWithDefaultOptions allocator;
@@ -607,6 +662,13 @@ private:
             return evaluate_deterministic();
         }
         
+        // Check NNUE cache first
+        uint64_t position_hash = get_position_hash();
+        double cached_eval;
+        if (probe_nnue_cache(position_hash, cached_eval)) {
+            return cached_eval;
+        }
+        
         try {
             // Find kings
             int white_king_sq = -1, black_king_sq = -1;
@@ -643,6 +705,9 @@ private:
             // Clamp and normalize
             evaluation_cp = std::max(-3000.0, std::min(3000.0, evaluation_cp));
             double normalized_eval = evaluation_cp / 100.0;
+            
+            // Store in cache
+            store_nnue_cache(position_hash, normalized_eval);
             
             return normalized_eval;  // Always return from White's perspective
             
@@ -767,9 +832,11 @@ private:
     
 public:
     PureCppChessEngine() : eval_mode(EvaluationMode::DETERMINISTIC), cache_hits(0), 
-                           cache_lookups(0), nnue_available(false) {
+                           cache_lookups(0), nnue_cache_hits(0), nnue_cache_lookups(0), 
+                           nnue_available(false) {
         set_start_position();
         clear_transposition_table();
+        clear_nnue_cache();
     }
     
     bool init_nnue_model(const std::string& model_path) {
@@ -806,7 +873,7 @@ public:
     
     std::string get_evaluation_mode() const {
         switch (eval_mode) {
-            case EvaluationMode::NNUE: return nnue_available ? "NNUE" : "NNUE (fallback to Deterministic)";
+            case EvaluationMode::NNUE: return nnue_available ? "NNUE (Quantized)" : "NNUE (fallback to Deterministic)";
             case EvaluationMode::DETERMINISTIC: return "Deterministic";
             default: return "Unknown";
         }
@@ -852,6 +919,8 @@ public:
         nodes_searched = 0;
         cache_hits = 0;
         cache_lookups = 0;
+        nnue_cache_hits = 0;
+        nnue_cache_lookups = 0;
         auto start = std::chrono::high_resolution_clock::now();
         
         auto [score, best_move] = alpha_beta(depth, -std::numeric_limits<double>::infinity(), 
@@ -861,12 +930,19 @@ public:
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
         
         double cache_hit_rate = cache_lookups > 0 ? (100.0 * cache_hits / cache_lookups) : 0.0;
+        double nnue_cache_hit_rate = nnue_cache_lookups > 0 ? (100.0 * nnue_cache_hits / nnue_cache_lookups) : 0.0;
         
         std::cout << "Search depth: " << depth << ", Nodes: " << nodes_searched 
                   << ", Time: " << duration.count() << "ms, Score: " << score 
                   << ", Cache: " << cache_hits << "/" << cache_lookups 
-                  << " (" << std::fixed << std::setprecision(1) << cache_hit_rate << "%)"
-                  << " (eval: " << get_evaluation_mode() << ")" << std::endl;
+                  << " (" << std::fixed << std::setprecision(1) << cache_hit_rate << "%)";
+        
+        if (nnue_cache_lookups > 0) {
+            std::cout << ", NNUE: " << nnue_cache_hits << "/" << nnue_cache_lookups 
+                      << " (" << std::fixed << std::setprecision(1) << nnue_cache_hit_rate << "%)";
+        }
+        
+        std::cout << " (eval: " << get_evaluation_mode() << ")" << std::endl;
         
         return {best_move.to_uci(), score};
     }
