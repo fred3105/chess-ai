@@ -1,38 +1,96 @@
-import torch
-from train import encode_board
+import io
+import time
+
+import cairosvg
 import chess
 import chess.svg
-import time
+import numpy as np
 import pygame
-import io
+import torch
 from PIL import Image
-import cairosvg
+
+from nnue_model import HalfKPFeatureExtractor, create_nnue_model
 
 
 class ChessAI:
-    def __init__(self, model_path="chess_eval_net_jit.pt", device="mps"):
-        """Initialize the Chess AI with trained evaluation function"""
+    def __init__(self, model_path="checkpoints/best_model.pth", device="mps"):
+        """Initialize the Chess AI with trained NNUE evaluation function"""
         self.device = device
-        self.model = torch.jit.load(model_path)
+
+        # Create NNUE model
+        self.model = create_nnue_model()
+
+        # Load trained weights
+        checkpoint = torch.load(model_path, map_location=device)
+        if "model_state_dict" in checkpoint:
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            self.model.load_state_dict(checkpoint)
 
         self.model.to(device)
-        print(f"Chess AI initialized with model on {device}")
+        self.model.eval()  # Set to evaluation mode
+
+        # Initialize feature extractor
+        self.feature_extractor = HalfKPFeatureExtractor()
+
+        print(f"Chess AI initialized with NNUE model on {device}")
+
+    def _board_to_array(self, board: chess.Board) -> np.ndarray:
+        """Convert chess board to 8x8 numpy array for NNUE feature extraction"""
+        array = np.zeros((8, 8), dtype=np.int8)
+
+        piece_values = {
+            chess.PAWN: 1,
+            chess.KNIGHT: 2,
+            chess.BISHOP: 3,
+            chess.ROOK: 4,
+            chess.QUEEN: 5,
+            chess.KING: 6,
+        }
+
+        for square in chess.SQUARES:
+            piece = board.piece_at(square)
+            if piece:
+                row, col = divmod(square, 8)
+                value = piece_values[piece.piece_type]
+                if not piece.color:  # Black pieces negative
+                    value = -value
+                array[7 - row, col] = value  # Flip row for correct orientation
+
+        return array
 
     def evaluate_position(self, board):
-        """Evaluate a chess position using the trained neural network"""
-        # Encode the position
-        encoded = encode_board(board)
+        """Evaluate a chess position using the trained NNUE model"""
+        # Convert board to numpy array
+        board_array = self._board_to_array(board)
 
-        # Get evaluation from neural network
+        # Find king squares
+        white_king_sq = board.king(chess.WHITE)
+        black_king_sq = board.king(chess.BLACK)
+
+        if white_king_sq is None or black_king_sq is None:
+            # Invalid position - return neutral evaluation
+            return 0.0
+
+        # Extract HalfKP features
+        white_features, black_features = self.feature_extractor.extract_halfkp_features(
+            board_array, white_king_sq, black_king_sq
+        )
+
+        # Get evaluation from NNUE model
         with torch.no_grad():
-            x = torch.tensor(encoded, dtype=torch.float32).unsqueeze(0).to(self.device)
-            evaluation = float(self.model(x).item())
+            white_features = white_features.unsqueeze(0).to(self.device)
+            black_features = black_features.unsqueeze(0).to(self.device)
+            evaluation_cp = float(self.model(white_features, black_features).item())
 
-        # Convert 0-1 scale to centered evaluation (-1 to 1)
-        # 1 = very favorable for white, 0 = very favorable for black
-        centered_eval = (evaluation - 0.5) * 2
+        # Convert centipawns to normalized scale for alpha-beta search
+        # Clamp extreme values and normalize to reasonable range
+        evaluation_cp = max(-3000, min(3000, evaluation_cp))
+        normalized_eval = evaluation_cp / 100.0  # Convert to "pawn units"
+        # NNUE returns evaluation from White's perspective (positive = good for White)
+        # No need to adjust based on turn - minimax handles perspective
 
-        return centered_eval
+        return normalized_eval
 
     def alpha_beta(
         self,
@@ -40,37 +98,33 @@ class ChessAI:
         depth: int,
         alpha: float,
         beta: float,
-        is_white_turn: bool,
     ):
-        """Alpha-beta pruning minimax algorithm with move ordering"""
+        """Alpha-beta pruning minimax algorithm"""
         if depth == 0:
             eval_score = self.evaluate_position(board)
-            # Return evaluation from current player's perspective
-            return eval_score if is_white_turn else -eval_score, None
+            return eval_score, None
 
         legal_moves = list(board.legal_moves)
 
         # Terminal node (no legal moves)
         if not legal_moves:
             if board.is_check():
-                # Checkmate - return very bad score for current player
-                return -1000 + depth, None  # Prefer faster checkmate
+                # Checkmate - return score based on who's checkmated
+                if board.turn == chess.WHITE:  # White is checkmated
+                    return -1000 + depth, None  # Very bad for White
+                else:  # Black is checkmated
+                    return 1000 - depth, None  # Very good for White
             else:
                 # Stalemate
                 return 0, None
 
         best_move = None
 
-        if is_white_turn:  # White maximizes
+        if board.turn == chess.WHITE:  # White maximizes
             max_eval = float("-inf")
             for move in legal_moves:
-                # Make move
                 board.push(move)
-
-                # Recursive call
-                eval_score, _ = self.alpha_beta(board, depth - 1, alpha, beta, False)
-
-                # Unmake move
+                eval_score, _ = self.alpha_beta(board, depth - 1, alpha, beta)
                 board.pop()
 
                 if eval_score > max_eval:
@@ -79,19 +133,14 @@ class ChessAI:
 
                 alpha = max(alpha, eval_score)
                 if beta <= alpha:
-                    break  # Alpha-beta pruning
+                    break
 
             return max_eval, best_move
         else:  # Black minimizes
             min_eval = float("inf")
             for move in legal_moves:
-                # Make move
                 board.push(move)
-
-                # Recursive call
-                eval_score, _ = self.alpha_beta(board, depth - 1, alpha, beta, True)
-
-                # Unmake move
+                eval_score, _ = self.alpha_beta(board, depth - 1, alpha, beta)
                 board.pop()
 
                 if eval_score < min_eval:
@@ -100,7 +149,7 @@ class ChessAI:
 
                 beta = min(beta, eval_score)
                 if beta <= alpha:
-                    break  # Alpha-beta pruning
+                    break
 
             return min_eval, best_move
 
@@ -122,7 +171,6 @@ class ChessAI:
                     current_depth,
                     float("-inf"),
                     float("inf"),
-                    board.turn == chess.WHITE,
                 )
 
                 if move is not None:
@@ -442,8 +490,7 @@ class ChessGUI:
 
 if __name__ == "__main__":
     # Initialize the Chess AI
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    ai = ChessAI(device=device)
+    ai = ChessAI(device="cpu")
 
     # Simple command line setup for now
     print("Welcome to Chess AI!")
@@ -452,12 +499,14 @@ if __name__ == "__main__":
         human_color = "white"
 
     try:
-        depth = int(input("Choose AI depth (1-6) [4]: ") or 4)
-        if depth < 1 or depth > 6:
-            depth = 4
+        depth = int(input("Choose AI depth (0-3) [1]: ") or 1)
+        if depth < 0 or depth > 3:
+            depth = 1
+        # Convert to odd depth to avoid evaluation perspective issues
+        odd_depth = depth * 2 + 1
     except ValueError:
-        depth = 4
+        odd_depth = 3
 
     # Start the chess GUI
-    gui = ChessGUI(ai, human_color=human_color, depth=depth)
+    gui = ChessGUI(ai, human_color=human_color, depth=odd_depth)
     gui.run()

@@ -185,6 +185,10 @@ class DatasetGenerator:
             # Classify position type
             pos_type = self._classify_position(board)
 
+            # Filter based on filter_quiet parameter
+            if filter_quiet and pos_type != PositionType.QUIET:
+                continue
+
             # Higher sampling rate for quality positions from grandmaster games
             # Sample more frequently to get good variety
             sample_rate = 0.2  # 20% of positions from grandmaster games
@@ -266,13 +270,24 @@ class DatasetGenerator:
 
     def _classify_position(self, board: chess.Board) -> str:
         """Classify position type for balanced dataset creation"""
-        # Check for tactical positions (checks, captures, threats)
+        # Check for tactical positions (checks, significant captures)
         if board.is_check():
             return PositionType.TACTICAL
 
-        # Check for available captures
-        has_captures = any(board.is_capture(move) for move in board.legal_moves)
-        if has_captures:
+        # Only consider significant captures (not just any capture)
+        significant_captures = 0
+        for move in board.legal_moves:
+            if board.is_capture(move):
+                captured_piece = board.piece_at(move.to_square)
+                if captured_piece and captured_piece.piece_type in [
+                    chess.QUEEN,
+                    chess.ROOK,
+                    chess.BISHOP,
+                    chess.KNIGHT,
+                ]:
+                    significant_captures += 1
+        # Only tactical if there are multiple significant captures available
+        if significant_captures >= 2:
             return PositionType.TACTICAL
 
         # Check material imbalance
@@ -448,7 +463,10 @@ class DatasetGenerator:
                                 multipv=1,
                             )
 
-                            score = info["score"].white()
+                            if "score" in info:
+                                score = info["score"].white()
+                            else:
+                                continue
                             if score.is_mate():
                                 eval_cp = 10000 if score.mate() > 0 else -10000
                             else:
@@ -481,7 +499,7 @@ def create_balanced_datasets(
     pgn_files: list[str] | None = None,
     engine_path: str | None = None,
     min_elo: int = 2000,
-    quiet_ratio: float = 0.5,
+    quiet_ratio: float = 0.5,  # Kept for compatibility but not used
 ) -> tuple[NNUEDataset, NNUEDataset]:
     """Create carefully balanced training and validation datasets from grandmaster PGN files
 
@@ -495,37 +513,32 @@ def create_balanced_datasets(
     all_positions = []
 
     # Generate from PGN files if provided
+    target_positions = (train_size + val_size) * 3  # Generate more to allow filtering
     if pgn_files:
         for pgn_file in pgn_files:
             if os.path.exists(pgn_file):
                 logger.info(f"Processing {pgn_file}")
                 positions = generator.generate_from_pgn(
                     pgn_file,
-                    max_positions=(train_size + val_size)
-                    * 3,  # Generate more to allow filtering
+                    max_positions=target_positions
+                    - len(all_positions),  # Only get what we need
                     min_elo=min_elo,
                     filter_quiet=False,  # Don't filter, we'll balance later
                 )
                 all_positions.extend(positions)
+                logger.info(f"Found {len(positions)} positions from {pgn_file}")
+
+                # Stop early if we have enough positions
+                if len(all_positions) >= target_positions:
+                    logger.info(
+                        f"Collected sufficient positions ({len(all_positions)}), stopping early"
+                    )
+                    break
             else:
                 logger.warning(f"PGN file not found: {pgn_file}")
 
-    # Generate additional positions if needed
-    if len(all_positions) < (train_size + val_size) * 2:
-        needed = (train_size + val_size) * 2 - len(all_positions)
-        logger.info(f"Generating {needed} additional positions")
-        additional_positions = generator.generate_random_positions(needed)
-
-        # Classify random positions
-        classified_positions = []
-        for pos in additional_positions:
-            board = chess.Board(pos.fen)
-            pos_type = generator._classify_position(board)
-            classified_positions.append(
-                ChessPosition(pos.fen, pos.evaluation, pos.outcome, pos_type)
-            )
-
-        all_positions.extend(classified_positions)
+    # Only use real positions from GM games - no random generation
+    logger.info(f"Using only real positions from GM games: {len(all_positions)} total")
 
     # Separate positions by type
     quiet_positions = []
@@ -544,45 +557,80 @@ def create_balanced_datasets(
         else:  # UNUSUAL
             unusual_positions.append(pos)
 
+    logger.info(f"Total positions found: {len(all_positions)}")
     logger.info("Position distribution:")
     logger.info(f"  Quiet: {len(quiet_positions)}")
-    logger.info(f"  Tactical: {len(tactical_positions)}")
+    logger.info(f"  Tactical: {len(tactical_positions)} (will be excluded)")
     logger.info(f"  Imbalanced: {len(imbalanced_positions)}")
     logger.info(f"  Unusual: {len(unusual_positions)}")
 
+    # Log how many we can actually use
+    usable_positions = (
+        len(quiet_positions) + len(imbalanced_positions) + len(unusual_positions)
+    )
+    logger.info(f"Usable positions (quiet + imbalanced + unusual): {usable_positions}")
+
+    target_total = train_size + val_size
+    if usable_positions < target_total:
+        logger.warning(
+            f"Not enough usable positions! Requested {target_total}, using all available {usable_positions}"
+        )
+        # Use all available positions - adjust split to maintain roughly the same ratio
+        if usable_positions > 0:
+            train_ratio = train_size / target_total
+            train_size = int(usable_positions * train_ratio)
+            val_size = usable_positions - train_size
+            logger.info(
+                f"Using all positions - Train: {train_size}, Validation: {val_size}"
+            )
+        else:
+            logger.error("No usable positions available!")
+            train_size = val_size = 0
+    else:
+        logger.info(
+            f"Sufficient positions available for target dataset size of {target_total}"
+        )
+
     # Create balanced datasets
     def create_balanced_split(total_size: int) -> list[ChessPosition]:
-        # Only select quiet and imbalanced positions (no tactical ones)
-        quiet_needed = total_size // 2
-        imbalanced_needed = total_size - quiet_needed
+        # Use all non-tactical positions if we don't have enough
+        all_usable = quiet_positions + imbalanced_positions + unusual_positions
 
-        selected_positions = []
-
-        # Select quiet positions
-        if len(quiet_positions) >= quiet_needed:
-            selected_positions.extend(random.sample(quiet_positions, quiet_needed))
+        if len(all_usable) <= total_size:
+            # Use all available positions
+            random.shuffle(all_usable)
+            logger.info(f"Using all {len(all_usable)} available non-tactical positions")
+            return all_usable
         else:
-            selected_positions.extend(quiet_positions)
-            logger.warning(
-                f"Not enough quiet positions, using all {len(quiet_positions)} available"
-            )
+            # We have enough - try to maintain balance
+            quiet_needed = total_size // 2
 
-        # Select imbalanced positions only (exclude tactical)
-        if len(imbalanced_positions) >= imbalanced_needed:
-            selected_positions.extend(random.sample(imbalanced_positions, imbalanced_needed))
-        else:
-            selected_positions.extend(imbalanced_positions)
-            # If we don't have enough imbalanced positions, fill with unusual positions
-            remaining_needed = imbalanced_needed - len(imbalanced_positions)
-            if remaining_needed > 0 and unusual_positions:
-                take_unusual = min(remaining_needed, len(unusual_positions))
-                selected_positions.extend(random.sample(unusual_positions, take_unusual))
-                logger.warning(
-                    f"Not enough imbalanced positions, adding {take_unusual} unusual positions"
-                )
+            selected_positions = []
 
-        random.shuffle(selected_positions)
-        return selected_positions[:total_size]
+            # Select quiet positions
+            if len(quiet_positions) >= quiet_needed:
+                selected_positions.extend(random.sample(quiet_positions, quiet_needed))
+            else:
+                selected_positions.extend(quiet_positions)
+
+            # Select imbalanced positions only (exclude tactical)
+            remaining_needed = total_size - len(selected_positions)
+            remaining_pools = [imbalanced_positions, unusual_positions]
+            remaining_pools = [pool for pool in remaining_pools if len(pool) > 0]
+
+            if remaining_pools and remaining_needed > 0:
+                per_type = remaining_needed // len(remaining_pools)
+                extra = remaining_needed % len(remaining_pools)
+
+                for i, pool in enumerate(remaining_pools):
+                    take = per_type + (1 if i < extra else 0)
+                    if len(pool) >= take:
+                        selected_positions.extend(random.sample(pool, take))
+                    else:
+                        selected_positions.extend(pool)
+
+            random.shuffle(selected_positions)
+            return selected_positions[:total_size]
 
     # Create train and validation sets
     train_positions = create_balanced_split(train_size)

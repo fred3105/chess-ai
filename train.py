@@ -109,7 +109,8 @@ class NNUETrainer:
                     }
                 )
 
-        return total_loss / len(self.train_loader)
+        # Normalize by dataset size instead of number of batches  
+        return total_loss / len(self.train_loader.dataset)
 
     def validate(self) -> float:
         """Validate the model"""
@@ -131,7 +132,8 @@ class NNUETrainer:
                 total_loss += loss.item()
                 progress_bar.set_postfix({"val_loss": f"{loss.item():.4f}"})
 
-        return total_loss / len(self.val_loader)
+        # Normalize by dataset size instead of number of batches
+        return total_loss / len(self.val_loader.dataset)
 
     def get_lr(self) -> float:
         """Get current learning rate"""
@@ -302,12 +304,18 @@ def main():
         dropout_rate=args.dropout,
     )
 
+    # Get PGN files from data directory
+    import glob
+    pgn_files = glob.glob("data/*.pgn")
+    logger.info(f"Found {len(pgn_files)} PGN files")
+    
     # Create datasets
     logger.info("Creating balanced datasets from grandmaster games...")
     train_dataset, val_dataset = create_balanced_datasets(
         data_dir="data",
         train_size=args.train_size,
         val_size=args.val_size,
+        pgn_files=pgn_files,
         min_elo=args.min_elo,
         quiet_ratio=args.quiet_ratio,
     )

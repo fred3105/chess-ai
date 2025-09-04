@@ -83,11 +83,11 @@ All training metrics automatically logged:
 uv run train.py --train-size 25000 --epochs 20
 
 # Production run - large, comprehensive
-uv run train.py --train-size 500000 --epochs 100
+uv run train.py --train-size 1000000 --epochs 100
 
 # Balanced experiment - test different ratios
 uv run train.py --quiet-ratio 0.3  # 30% quiet, 70% complex
-python train.py --quiet-ratio 0.7  # 70% quiet, 30% complex
+uv run train.py --quiet-ratio 0.7  # 70% quiet, 30% complex
 
 # Hardware optimization
 uv run train.py --batch-size 8192 --num-workers 6  # More parallel
