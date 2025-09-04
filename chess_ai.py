@@ -337,12 +337,12 @@ if __name__ == "__main__":
         from pure_cpp_chess_ai import PureCppChessAI
 
         ai = PureCppChessAI(evaluation_mode="nnue")
-        depth = 5
+        depth = 3
     else:
         from pure_cpp_chess_ai import PureCppChessAI
 
         ai = PureCppChessAI(evaluation_mode="deterministic")
-        depth = 9
+        depth = 7
 
     # Game setup
     human_color = input("Choose your color (white/black) [white]: ").strip().lower()

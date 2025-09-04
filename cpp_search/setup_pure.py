@@ -1,7 +1,6 @@
 import pybind11
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 from setuptools import setup
-import os
 
 # ONNX Runtime paths
 onnx_include_path = "/opt/homebrew/Cellar/onnxruntime/1.22.2_2/include/onnxruntime"

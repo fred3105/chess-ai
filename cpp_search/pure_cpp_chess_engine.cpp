@@ -12,6 +12,8 @@
 #include <iostream>
 #include <memory>
 #include <cmath>
+#include <random>
+#include <iomanip>
 
 // ONNX Runtime includes
 #include <onnxruntime_cxx_api.h>
@@ -80,6 +82,92 @@ struct Move {
     }
 };
 
+// Transposition table entry types
+enum class EntryType {
+    EXACT,
+    LOWER_BOUND,
+    UPPER_BOUND
+};
+
+// Transposition table entry
+struct TTEntry {
+    uint64_t zobrist_hash;
+    double score;
+    int depth;
+    EntryType type;
+    Move best_move;
+    
+    TTEntry() : zobrist_hash(0), score(0.0), depth(-1), type(EntryType::EXACT) {}
+};
+
+// Zobrist hash class for position caching
+class ZobristHash {
+private:
+    std::array<std::array<uint64_t, 12>, 64> piece_keys;  // [square][piece_type]
+    uint64_t side_key;
+    std::array<uint64_t, 16> castling_keys;  // castling rights
+    std::array<uint64_t, 64> en_passant_keys;  // en passant squares
+    
+public:
+    ZobristHash() {
+        std::mt19937_64 rng(12345);  // Fixed seed for reproducibility
+        std::uniform_int_distribution<uint64_t> dist;
+        
+        // Initialize piece keys
+        for (int sq = 0; sq < 64; sq++) {
+            for (int piece = 0; piece < 12; piece++) {
+                piece_keys[sq][piece] = dist(rng);
+            }
+        }
+        
+        // Initialize other keys
+        side_key = dist(rng);
+        for (int i = 0; i < 16; i++) {
+            castling_keys[i] = dist(rng);
+        }
+        for (int i = 0; i < 64; i++) {
+            en_passant_keys[i] = dist(rng);
+        }
+    }
+    
+    int piece_to_index(int piece) const {
+        if (piece == 0) return -1;
+        int type = abs(piece) - 1;  // 0-5 for pawn-king
+        return piece > 0 ? type : type + 6;
+    }
+    
+    uint64_t hash_position(const std::array<int, 64>& board, bool white_to_move, 
+                          int castling_rights, int en_passant_square) const {
+        uint64_t hash = 0;
+        
+        // Hash pieces
+        for (int sq = 0; sq < 64; sq++) {
+            int piece = board[sq];
+            if (piece != 0) {
+                int piece_idx = piece_to_index(piece);
+                if (piece_idx >= 0) {
+                    hash ^= piece_keys[sq][piece_idx];
+                }
+            }
+        }
+        
+        // Hash side to move
+        if (white_to_move) {
+            hash ^= side_key;
+        }
+        
+        // Hash castling rights
+        hash ^= castling_keys[castling_rights & 15];
+        
+        // Hash en passant
+        if (en_passant_square >= 0 && en_passant_square < 64) {
+            hash ^= en_passant_keys[en_passant_square];
+        }
+        
+        return hash;
+    }
+};
+
 // HalfKP Feature Extractor in C++
 class HalfKPFeatureExtractor {
 private:
@@ -137,6 +225,13 @@ private:
     EvaluationMode eval_mode;
     int nodes_searched;
     
+    // Transposition table for position caching
+    static constexpr size_t TT_SIZE = 1048576;  // 1M entries
+    std::array<TTEntry, TT_SIZE> transposition_table;
+    ZobristHash zobrist;
+    int cache_hits;
+    int cache_lookups;
+    
     // ONNX Runtime components
     std::unique_ptr<Ort::Env> ort_env;
     std::unique_ptr<Ort::Session> ort_session;
@@ -173,6 +268,81 @@ private:
     
     int piece_type(int piece) const {
         return abs(piece);
+    }
+    
+    // Transposition table methods
+    uint64_t get_position_hash() const {
+        return zobrist.hash_position(board, white_to_move, castling_rights, en_passant_square);
+    }
+    
+    void store_tt_entry(uint64_t hash, double score, int depth, EntryType type, const Move& best_move) {
+        size_t index = hash % TT_SIZE;
+        TTEntry& entry = transposition_table[index];
+        
+        // Replace if empty, deeper search, or same depth but different position
+        if (entry.depth <= depth || entry.zobrist_hash != hash) {
+            entry.zobrist_hash = hash;
+            entry.score = score;
+            entry.depth = depth;
+            entry.type = type;
+            entry.best_move = best_move;
+        }
+    }
+    
+    bool probe_tt_entry(uint64_t hash, int depth, double alpha, double beta, double& score, Move& best_move) {
+        cache_lookups++;
+        size_t index = hash % TT_SIZE;
+        const TTEntry& entry = transposition_table[index];
+        
+        // Check for exact hash match to avoid false positives from collisions
+        if (entry.zobrist_hash == hash && entry.depth >= depth) {
+            cache_hits++;
+            best_move = entry.best_move;
+            
+            // Validate that the cached move is still legal in current position
+            auto legal_moves = generate_moves();
+            bool move_is_legal = false;
+            for (const auto& move : legal_moves) {
+                if (move.from_square == best_move.from_square && 
+                    move.to_square == best_move.to_square) {
+                    move_is_legal = true;
+                    break;
+                }
+            }
+            
+            // If cached move is illegal, this is likely a hash collision
+            if (!move_is_legal && best_move.from_square >= 0) {
+                return false;
+            }
+            
+            switch (entry.type) {
+                case EntryType::EXACT:
+                    score = entry.score;
+                    return true;
+                case EntryType::LOWER_BOUND:
+                    if (entry.score >= beta) {
+                        score = entry.score;
+                        return true;
+                    }
+                    break;
+                case EntryType::UPPER_BOUND:
+                    if (entry.score <= alpha) {
+                        score = entry.score;
+                        return true;
+                    }
+                    break;
+            }
+        }
+        
+        return false;
+    }
+    
+    void clear_transposition_table() {
+        for (auto& entry : transposition_table) {
+            entry = TTEntry();
+        }
+        cache_hits = 0;
+        cache_lookups = 0;
     }
     
     // Initialize ONNX Runtime
@@ -428,7 +598,7 @@ private:
         
         const_cast<PureCppChessEngine*>(this)->white_to_move = original_turn;
         
-        return white_to_move ? score : -score;
+        return score;  // Always return from White's perspective
     }
     
     // Pure C++ NNUE evaluation
@@ -474,7 +644,7 @@ private:
             evaluation_cp = std::max(-3000.0, std::min(3000.0, evaluation_cp));
             double normalized_eval = evaluation_cp / 100.0;
             
-            return white_to_move ? normalized_eval : -normalized_eval;
+            return normalized_eval;  // Always return from White's perspective
             
         } catch (const std::exception& e) {
             std::cerr << "NNUE evaluation error: " << e.what() << std::endl;
@@ -495,60 +665,111 @@ private:
     std::pair<double, Move> alpha_beta(int depth, double alpha, double beta, bool maximizing) {
         nodes_searched++;
         
+        // Get position hash for transposition table
+        uint64_t position_hash = get_position_hash();
+        double tt_score;
+        Move tt_move;
+        
+        // Probe transposition table
+        if (probe_tt_entry(position_hash, depth, alpha, beta, tt_score, tt_move)) {
+            return {tt_score, tt_move};
+        }
+        
         if (depth == 0) {
-            return {evaluate(), Move()};
+            double eval = evaluate();
+            store_tt_entry(position_hash, eval, depth, EntryType::EXACT, Move());
+            return {eval, Move()};
         }
         
         auto moves = generate_moves();
         if (moves.empty()) {
-            return maximizing ? 
-                std::make_pair(-10000.0 + (6 - depth), Move()) : 
-                std::make_pair(10000.0 - (6 - depth), Move());
+            double mate_score = maximizing ? 
+                (-10000.0 + (6 - depth)) : 
+                (10000.0 - (6 - depth));
+            store_tt_entry(position_hash, mate_score, depth, EntryType::EXACT, Move());
+            return {mate_score, Move()};
         }
         
-        // Move ordering - prioritize captures
-        std::sort(moves.begin(), moves.end(), [](const Move& a, const Move& b) {
-            return abs(a.captured) > abs(b.captured);
-        });
+        // Move ordering - prioritize TT move, then captures
+        if (tt_move.from_square >= 0) {
+            // Move TT move to front if it exists in legal moves
+            auto it = std::find_if(moves.begin(), moves.end(), 
+                [&tt_move](const Move& m) {
+                    return m.from_square == tt_move.from_square && m.to_square == tt_move.to_square;
+                });
+            if (it != moves.end()) {
+                std::swap(*it, moves[0]);
+            }
+        }
+        
+        // Sort remaining moves by capture value
+        std::sort(moves.begin() + (tt_move.from_square >= 0 ? 1 : 0), moves.end(), 
+                  [](const Move& a, const Move& b) {
+                      return abs(a.captured) > abs(b.captured);
+                  });
         
         Move best_move;
+        double best_score;
+        EntryType entry_type = EntryType::UPPER_BOUND;
         
         if (maximizing) {
-            double max_eval = -std::numeric_limits<double>::infinity();
+            best_score = -std::numeric_limits<double>::infinity();
             for (const auto& move : moves) {
                 make_move(move);
                 auto [eval, _] = alpha_beta(depth - 1, alpha, beta, false);
                 unmake_move(move);
                 
-                if (eval > max_eval) {
-                    max_eval = eval;
+                if (eval > best_score) {
+                    best_score = eval;
                     best_move = move;
                 }
-                alpha = std::max(alpha, eval);
-                if (beta <= alpha) break;
+                
+                if (eval >= beta) {
+                    // Beta cutoff - store as lower bound
+                    store_tt_entry(position_hash, eval, depth, EntryType::LOWER_BOUND, move);
+                    return {eval, move};
+                }
+                
+                if (eval > alpha) {
+                    alpha = eval;
+                    entry_type = EntryType::EXACT;
+                }
             }
-            return {max_eval, best_move};
         } else {
-            double min_eval = std::numeric_limits<double>::infinity();
+            best_score = std::numeric_limits<double>::infinity();
             for (const auto& move : moves) {
                 make_move(move);
                 auto [eval, _] = alpha_beta(depth - 1, alpha, beta, true);
                 unmake_move(move);
                 
-                if (eval < min_eval) {
-                    min_eval = eval;
+                if (eval < best_score) {
+                    best_score = eval;
                     best_move = move;
                 }
-                beta = std::min(beta, eval);
-                if (beta <= alpha) break;
+                
+                if (eval <= alpha) {
+                    // Alpha cutoff - store as upper bound
+                    store_tt_entry(position_hash, eval, depth, EntryType::UPPER_BOUND, move);
+                    return {eval, move};
+                }
+                
+                if (eval < beta) {
+                    beta = eval;
+                    entry_type = EntryType::EXACT;
+                }
             }
-            return {min_eval, best_move};
         }
+        
+        // Store result in transposition table
+        store_tt_entry(position_hash, best_score, depth, entry_type, best_move);
+        return {best_score, best_move};
     }
     
 public:
-    PureCppChessEngine() : eval_mode(EvaluationMode::DETERMINISTIC), nnue_available(false) {
+    PureCppChessEngine() : eval_mode(EvaluationMode::DETERMINISTIC), cache_hits(0), 
+                           cache_lookups(0), nnue_available(false) {
         set_start_position();
+        clear_transposition_table();
     }
     
     bool init_nnue_model(const std::string& model_path) {
@@ -629,6 +850,8 @@ public:
     
     std::pair<std::string, double> get_best_move(int depth = 5) {
         nodes_searched = 0;
+        cache_hits = 0;
+        cache_lookups = 0;
         auto start = std::chrono::high_resolution_clock::now();
         
         auto [score, best_move] = alpha_beta(depth, -std::numeric_limits<double>::infinity(), 
@@ -637,8 +860,12 @@ public:
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
         
+        double cache_hit_rate = cache_lookups > 0 ? (100.0 * cache_hits / cache_lookups) : 0.0;
+        
         std::cout << "Search depth: " << depth << ", Nodes: " << nodes_searched 
                   << ", Time: " << duration.count() << "ms, Score: " << score 
+                  << ", Cache: " << cache_hits << "/" << cache_lookups 
+                  << " (" << std::fixed << std::setprecision(1) << cache_hit_rate << "%)"
                   << " (eval: " << get_evaluation_mode() << ")" << std::endl;
         
         return {best_move.to_uci(), score};
