@@ -35,6 +35,8 @@ class PureCppChessAI:
         self,
         evaluation_mode="deterministic",
         model_path="checkpoints/nnue_model.onnx",
+        opening_book_path="opening_book.txt",
+        use_endgame_patterns=True,
     ):
         if not CPP_AVAILABLE:
             raise ImportError(
@@ -57,6 +59,20 @@ class PureCppChessAI:
                 self.engine.set_evaluation_mode("deterministic")
         else:
             self.engine.set_evaluation_mode("deterministic")
+        
+        # Load opening book if available
+        if os.path.exists(opening_book_path):
+            if self.engine.load_opening_book(opening_book_path):
+                print(f"✅ Opening book loaded from {opening_book_path}")
+            else:
+                print(f"❌ Failed to load opening book from {opening_book_path}")
+        else:
+            print(f"ℹ️  Opening book not found at {opening_book_path}")
+        
+        # Enable endgame patterns
+        self.engine.set_use_endgame_patterns(use_endgame_patterns)
+        if use_endgame_patterns:
+            print("✅ Endgame patterns enabled")
 
     def set_evaluation_mode(self, mode):
         """Switch between evaluation modes"""

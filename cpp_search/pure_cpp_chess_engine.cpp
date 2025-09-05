@@ -14,6 +14,8 @@
 #include <cmath>
 #include <random>
 #include <iomanip>
+#include <fstream>
+#include <functional>
 
 // ONNX Runtime includes
 #include <onnxruntime_cxx_api.h>
@@ -49,6 +51,29 @@ const int KNIGHT_TABLE[64] = {
 enum class EvaluationMode {
     DETERMINISTIC,
     NNUE
+};
+
+// Opening book entry
+struct BookEntry {
+    uint64_t hash;
+    uint16_t move;
+    uint16_t weight;
+    uint32_t learn;
+    
+    BookEntry() : hash(0), move(0), weight(0), learn(0) {}
+    BookEntry(uint64_t h, uint16_t m, uint16_t w, uint32_t l) : hash(h), move(m), weight(w), learn(l) {}
+};
+
+// Endgame pattern
+struct EndgamePattern {
+    std::string name;
+    std::function<bool(const std::array<int, 64>&, bool)> recognizer;
+    std::function<std::string(const std::array<int, 64>&, bool)> get_move;
+    
+    EndgamePattern(const std::string& n, 
+                   std::function<bool(const std::array<int, 64>&, bool)> r,
+                   std::function<std::string(const std::array<int, 64>&, bool)> m)
+        : name(n), recognizer(r), get_move(m) {}
 };
 
 struct Move {
@@ -250,6 +275,15 @@ private:
     int nnue_cache_hits;
     int nnue_cache_lookups;
     
+    // Opening book
+    std::vector<BookEntry> opening_book;
+    bool opening_book_loaded;
+    std::mt19937 book_rng;
+    
+    // Endgame patterns
+    std::vector<EndgamePattern> endgame_patterns;
+    bool use_endgame_patterns;
+    
     static int square_from_coords(int file, int rank) {
         return rank * 8 + file;
     }
@@ -374,6 +408,320 @@ private:
         }
         nnue_cache_hits = 0;
         nnue_cache_lookups = 0;
+    }
+    
+    // Polyglot hash calculation for opening book
+    uint64_t get_polyglot_hash() const {
+        // Polyglot uses different zobrist keys than our engine
+        // For simplicity, we'll use a basic hash that works with simple opening books
+        uint64_t hash = 0;
+        
+        for (int sq = 0; sq < 64; sq++) {
+            int piece = board[sq];
+            if (piece != 0) {
+                // Simple hash based on piece and position
+                hash ^= (uint64_t)(abs(piece) + (piece > 0 ? 0 : 6)) * (sq + 1) * 0x9E3779B9;
+            }
+        }
+        
+        if (!white_to_move) hash ^= 0x123456789ABCDEF0ULL;
+        hash ^= castling_rights * 0x987654321ULL;
+        if (en_passant_square >= 0) hash ^= en_passant_square * 0xFEDCBA9876543210ULL;
+        
+        return hash;
+    }
+    
+    // Load simple text-based opening book
+    bool load_opening_book(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            return false;
+        }
+        
+        opening_book.clear();
+        std::string line;
+        
+        while (std::getline(file, line)) {
+            if (line.empty() || line[0] == '#' || line[0] == ' ') continue;
+            
+            // Parse the line - find the last two space-separated tokens (move and weight)
+            size_t last_space = line.rfind(' ');
+            if (last_space == std::string::npos) continue;
+            
+            size_t second_last_space = line.rfind(' ', last_space - 1);
+            if (second_last_space == std::string::npos) continue;
+            
+            std::string fen = line.substr(0, second_last_space);
+            std::string move = line.substr(second_last_space + 1, last_space - second_last_space - 1);
+            int weight = std::stoi(line.substr(last_space + 1));
+            
+            // Debug: uncomment next line for parsing debug
+            // std::cout << "Parsing: FEN='" << fen << "' MOVE='" << move << "' WEIGHT=" << weight << std::endl;
+            
+            // Set temporary position to calculate hash
+            std::array<int, 64> temp_board = board;
+            bool temp_white_to_move = white_to_move;
+            int temp_castling = castling_rights;
+            int temp_ep = en_passant_square;
+            
+            set_fen(fen);
+            uint64_t hash = get_polyglot_hash();
+            
+            // Convert move to internal format (simplified)
+            uint16_t encoded_move = 0;
+            if (move.length() >= 4) {
+                int from_sq = (move[0] - 'a') + (move[1] - '1') * 8;
+                int to_sq = (move[2] - 'a') + (move[3] - '1') * 8;
+                encoded_move = (from_sq) | (to_sq << 6);
+            }
+            
+            opening_book.emplace_back(hash, encoded_move, weight, 0);
+            
+            // Restore position
+            board = temp_board;
+            white_to_move = temp_white_to_move;
+            castling_rights = temp_castling;
+            en_passant_square = temp_ep;
+        }
+        
+        // Sort by hash for binary search
+        std::sort(opening_book.begin(), opening_book.end(), 
+                  [](const BookEntry& a, const BookEntry& b) { return a.hash < b.hash; });
+        
+        opening_book_loaded = true;
+        std::cout << "Loaded " << opening_book.size() << " opening book entries" << std::endl;
+        return true;
+    }
+    
+    // Probe opening book
+    std::string probe_opening_book() {
+        if (!opening_book_loaded || opening_book.empty()) {
+            return "";
+        }
+        
+        uint64_t hash = get_polyglot_hash();
+        
+        // Find entries with matching hash
+        auto it = std::lower_bound(opening_book.begin(), opening_book.end(), hash,
+                                   [](const BookEntry& entry, uint64_t h) { return entry.hash < h; });
+        
+        std::vector<BookEntry> candidates;
+        while (it != opening_book.end() && it->hash == hash) {
+            candidates.push_back(*it);
+            ++it;
+        }
+        
+        if (candidates.empty()) return "";
+        
+        // Weighted random selection
+        int total_weight = 0;
+        for (const auto& entry : candidates) {
+            total_weight += entry.weight;
+        }
+        
+        if (total_weight == 0) return "";
+        
+        std::uniform_int_distribution<int> dist(0, total_weight - 1);
+        int random_weight = dist(book_rng);
+        
+        int current_weight = 0;
+        for (const auto& entry : candidates) {
+            current_weight += entry.weight;
+            if (random_weight < current_weight) {
+                // Decode move
+                int from_sq = entry.move & 63;
+                int to_sq = (entry.move >> 6) & 63;
+                
+                char from_file = 'a' + (from_sq % 8);
+                char from_rank = '1' + (from_sq / 8);
+                char to_file = 'a' + (to_sq % 8);
+                char to_rank = '1' + (to_sq / 8);
+                
+                return std::string(1, from_file) + from_rank + to_file + to_rank;
+            }
+        }
+        
+        return "";
+    }
+    
+    // Initialize endgame patterns
+    void init_endgame_patterns() {
+        endgame_patterns.clear();
+        
+        // King + Queen vs King
+        endgame_patterns.emplace_back("KQvK", 
+            [](const std::array<int, 64>& board, bool white_to_move) -> bool {
+                int white_pieces = 0, black_pieces = 0;
+                bool white_has_queen = false, black_has_queen = false;
+                
+                for (int piece : board) {
+                    if (piece == 0) continue;
+                    if (piece > 0) {
+                        white_pieces++;
+                        if (piece == 5) white_has_queen = true;
+                    } else {
+                        black_pieces++;
+                        if (piece == -5) black_has_queen = true;
+                    }
+                }
+                
+                return (white_pieces == 2 && black_pieces == 1 && white_has_queen) ||
+                       (black_pieces == 2 && white_pieces == 1 && black_has_queen);
+            },
+            [](const std::array<int, 64>& board, bool white_to_move) -> std::string {
+                int friendly_king = -1, enemy_king = -1, queen = -1;
+                
+                for (int sq = 0; sq < 64; sq++) {
+                    int piece = board[sq];
+                    if (white_to_move) {
+                        if (piece == 6) friendly_king = sq;
+                        if (piece == -6) enemy_king = sq;
+                        if (piece == 5) queen = sq;
+                    } else {
+                        if (piece == -6) friendly_king = sq;
+                        if (piece == 6) enemy_king = sq;
+                        if (piece == -5) queen = sq;
+                    }
+                }
+                
+                if (friendly_king == -1 || enemy_king == -1 || queen == -1) return "";
+                
+                // Simple strategy: centralize the queen and push enemy king to edge
+                int enemy_file = enemy_king % 8;
+                int enemy_rank = enemy_king / 8;
+                int queen_file = queen % 8;
+                int queen_rank = queen / 8;
+                
+                // If enemy king is on edge, try to deliver checkmate
+                if (enemy_file == 0 || enemy_file == 7 || enemy_rank == 0 || enemy_rank == 7) {
+                    // Look for checkmate moves around enemy king
+                    for (int df = -1; df <= 1; df++) {
+                        for (int dr = -1; dr <= 1; dr++) {
+                            if (df == 0 && dr == 0) continue;
+                            int target_file = enemy_file + df;
+                            int target_rank = enemy_rank + dr;
+                            if (target_file >= 0 && target_file < 8 && target_rank >= 0 && target_rank < 8) {
+                                int target_sq = target_rank * 8 + target_file;
+                                if (board[target_sq] == 0) {
+                                    char from_file = 'a' + queen_file;
+                                    char from_rank = '1' + queen_rank;
+                                    char to_file = 'a' + target_file;
+                                    char to_rank = '1' + target_rank;
+                                    return std::string(1, from_file) + from_rank + to_file + to_rank;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Otherwise, centralize queen or push king to edge
+                int center_dist = abs(queen_file - 3) + abs(queen_rank - 3);
+                if (center_dist > 2) {
+                    // Move queen toward center
+                    int new_file = queen_file + (queen_file < 3 ? 1 : -1);
+                    int new_rank = queen_rank + (queen_rank < 3 ? 1 : -1);
+                    new_file = std::max(0, std::min(7, new_file));
+                    new_rank = std::max(0, std::min(7, new_rank));
+                    int new_sq = new_rank * 8 + new_file;
+                    
+                    if (board[new_sq] == 0) {
+                        char from_file = 'a' + queen_file;
+                        char from_rank = '1' + queen_rank;
+                        char to_file = 'a' + new_file;
+                        char to_rank = '1' + new_rank;
+                        return std::string(1, from_file) + from_rank + to_file + to_rank;
+                    }
+                }
+                
+                return "";
+            });
+        
+        // King + Rook vs King
+        endgame_patterns.emplace_back("KRvK",
+            [](const std::array<int, 64>& board, bool white_to_move) -> bool {
+                int white_pieces = 0, black_pieces = 0;
+                bool white_has_rook = false, black_has_rook = false;
+                
+                for (int piece : board) {
+                    if (piece == 0) continue;
+                    if (piece > 0) {
+                        white_pieces++;
+                        if (piece == 4) white_has_rook = true;
+                    } else {
+                        black_pieces++;
+                        if (piece == -4) black_has_rook = true;
+                    }
+                }
+                
+                return (white_pieces == 2 && black_pieces == 1 && white_has_rook) ||
+                       (black_pieces == 2 && white_pieces == 1 && black_has_rook);
+            },
+            [](const std::array<int, 64>& board, bool white_to_move) -> std::string {
+                int friendly_king = -1, enemy_king = -1, rook = -1;
+                
+                for (int sq = 0; sq < 64; sq++) {
+                    int piece = board[sq];
+                    if (white_to_move) {
+                        if (piece == 6) friendly_king = sq;
+                        if (piece == -6) enemy_king = sq;
+                        if (piece == 4) rook = sq;
+                    } else {
+                        if (piece == -6) friendly_king = sq;
+                        if (piece == 6) enemy_king = sq;
+                        if (piece == -4) rook = sq;
+                    }
+                }
+                
+                if (friendly_king == -1 || enemy_king == -1 || rook == -1) return "";
+                
+                int enemy_file = enemy_king % 8;
+                int enemy_rank = enemy_king / 8;
+                int rook_file = rook % 8;
+                int rook_rank = rook / 8;
+                
+                // Try to cut off the king with the rook
+                if (abs(enemy_file - 3) < abs(enemy_rank - 3)) {
+                    // Push king to top/bottom edge - use rook on same rank
+                    if (rook_rank != enemy_rank) {
+                        char from_file = 'a' + rook_file;
+                        char from_rank = '1' + rook_rank;
+                        char to_file = 'a' + rook_file;
+                        char to_rank = '1' + enemy_rank;
+                        return std::string(1, from_file) + from_rank + to_file + to_rank;
+                    }
+                } else {
+                    // Push king to left/right edge - use rook on same file
+                    if (rook_file != enemy_file) {
+                        char from_file = 'a' + rook_file;
+                        char from_rank = '1' + rook_rank;
+                        char to_file = 'a' + enemy_file;
+                        char to_rank = '1' + rook_rank;
+                        return std::string(1, from_file) + from_rank + to_file + to_rank;
+                    }
+                }
+                
+                return "";
+            });
+        
+        use_endgame_patterns = true;
+        std::cout << "Initialized " << endgame_patterns.size() << " endgame patterns" << std::endl;
+    }
+    
+    // Probe endgame patterns
+    std::string probe_endgame_patterns() {
+        if (!use_endgame_patterns) return "";
+        
+        for (const auto& pattern : endgame_patterns) {
+            if (pattern.recognizer(board, white_to_move)) {
+                std::string move = pattern.get_move(board, white_to_move);
+                if (!move.empty()) {
+                    std::cout << "Using endgame pattern: " << pattern.name << std::endl;
+                    return move;
+                }
+            }
+        }
+        
+        return "";
     }
     
     // Initialize ONNX Runtime
@@ -833,10 +1181,12 @@ private:
 public:
     PureCppChessEngine() : eval_mode(EvaluationMode::DETERMINISTIC), cache_hits(0), 
                            cache_lookups(0), nnue_cache_hits(0), nnue_cache_lookups(0), 
-                           nnue_available(false) {
+                           nnue_available(false), opening_book_loaded(false), use_endgame_patterns(false),
+                           book_rng(std::random_device{}()) {
         set_start_position();
         clear_transposition_table();
         clear_nnue_cache();
+        init_endgame_patterns();
     }
     
     bool init_nnue_model(const std::string& model_path) {
@@ -916,12 +1266,27 @@ public:
     }
     
     std::pair<std::string, double> get_best_move(int depth = 5) {
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        // First, check opening book
+        std::string book_move = probe_opening_book();
+        if (!book_move.empty()) {
+            std::cout << "Using opening book move: " << book_move << std::endl;
+            return {book_move, 0.0};
+        }
+        
+        // Check endgame patterns
+        std::string endgame_move = probe_endgame_patterns();
+        if (!endgame_move.empty()) {
+            return {endgame_move, 0.0};
+        }
+        
+        // Regular search
         nodes_searched = 0;
         cache_hits = 0;
         cache_lookups = 0;
         nnue_cache_hits = 0;
         nnue_cache_lookups = 0;
-        auto start = std::chrono::high_resolution_clock::now();
         
         auto [score, best_move] = alpha_beta(depth, -std::numeric_limits<double>::infinity(), 
                                            std::numeric_limits<double>::infinity(), white_to_move);
@@ -987,6 +1352,14 @@ public:
         }
         return false;
     }
+    
+    bool load_opening_book_file(const std::string& filename) {
+        return load_opening_book(filename);
+    }
+    
+    void set_use_endgame_patterns(bool use_patterns) {
+        use_endgame_patterns = use_patterns;
+    }
 };
 
 // Python bindings
@@ -1002,5 +1375,7 @@ PYBIND11_MODULE(pure_cpp_chess_engine, m) {
         .def("get_evaluation_mode", &PureCppChessEngine::get_evaluation_mode)
         .def("get_best_move", &PureCppChessEngine::get_best_move, py::arg("depth") = 5)
         .def("get_legal_moves", &PureCppChessEngine::get_legal_moves)
-        .def("make_uci_move", &PureCppChessEngine::make_uci_move);
+        .def("make_uci_move", &PureCppChessEngine::make_uci_move)
+        .def("load_opening_book", &PureCppChessEngine::load_opening_book_file)
+        .def("set_use_endgame_patterns", &PureCppChessEngine::set_use_endgame_patterns);
 }

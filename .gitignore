@@ -186,4 +186,4 @@ cython_debug/
 *.onnx
 *.pt
 /wandb
-nnue_profile_2025-09-05_00-26-11.json
+*.json
