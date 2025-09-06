@@ -187,3 +187,4 @@ cython_debug/
 *.pt
 /wandb
 *.json
+*.pkl

@@ -28,7 +28,7 @@ class ChessPosition:
         self.fen = fen
         self.evaluation = evaluation  # Engine evaluation in centipawns
         self.outcome = (
-            outcome  # Game outcome: 1.0 (white win), 0.5 (draw), 0.0 (black win)
+            outcome  # Game outcome: 1.0 (white win), 0.0 (draw), -1.0 (black win)
         )
         self.position_type = (
             position_type  # Position type: quiet, tactical, imbalanced, unusual
@@ -162,14 +162,14 @@ class DatasetGenerator:
         positions = []
         board = game.board()
 
-        # Get game outcome
+        # Get game outcome (using standard -1, 0, 1 encoding)
         result = game.headers.get("Result", "*")
         if result == "1-0":
-            outcome = 1.0
+            outcome = 1.0   # White wins
         elif result == "0-1":
-            outcome = 0.0
+            outcome = -1.0  # Black wins
         elif result == "1/2-1/2":
-            outcome = 0.5
+            outcome = 0.0   # Draw
         else:
             return positions
 
@@ -249,7 +249,7 @@ class DatasetGenerator:
             phase_eval = -abs(material_eval) * 0.1 if abs(material_eval) < 200 else 0
 
         # Outcome influence (stronger for GM games as they're more decisive)
-        outcome_influence = (outcome - 0.5) * 150  # +/- 75cp influence
+        outcome_influence = outcome * 75  # +/- 75cp influence
 
         # Game phase adjustment
         game_phase_factor = 1.0
@@ -402,7 +402,7 @@ class DatasetGenerator:
         material_eval = white_material - black_material
 
         # Bias evaluation towards game outcome
-        outcome_bias = (outcome - 0.5) * 200  # +/- 100cp bias
+        outcome_bias = outcome * 100  # +/- 100cp bias
 
         final_eval = material_eval + outcome_bias
 
@@ -499,13 +499,8 @@ def create_balanced_datasets(
     pgn_files: list[str] | None = None,
     engine_path: str | None = None,
     min_elo: int = 2000,
-    quiet_ratio: float = 0.5,  # Kept for compatibility but not used
 ) -> tuple[NNUEDataset, NNUEDataset]:
-    """Create carefully balanced training and validation datasets from grandmaster PGN files
-
-    Args:
-        quiet_ratio: Ratio of quiet positions (default 0.5 = 50% quiet, 50% complex)
-    """
+    """Create carefully balanced training and validation datasets from grandmaster PGN files"""
 
     os.makedirs(data_dir, exist_ok=True)
     generator = DatasetGenerator(engine_path)
