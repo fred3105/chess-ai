@@ -65,14 +65,14 @@ def create_chunked_dataset(
     try:
         for pgn_file in pgn_files:
             logger.info(f"🔄 Processing {pgn_file}")
-            # Calculate max positions per file, default to reasonable number if unlimited
+            # Calculate max positions per file, use unlimited if not specified
             if max_positions:
                 max_per_file = max_positions // len(pgn_files)
             else:
-                max_per_file = 50000  # Increased limit per file for better chunking
+                max_per_file = None  # No limit per file - process all positions
 
             positions = generator.generate_from_pgn(
-                pgn_file, max_positions=max_per_file
+                pgn_file, max_positions=max_per_file or float("inf")
             )
 
             for position in positions:
@@ -179,7 +179,7 @@ if __name__ == "__main__":
         "--data-dir", default="data/", help="Directory containing PGN files"
     )
     parser.add_argument(
-        "--chunk-size", type=int, default=100_000, help="Positions per chunk"
+        "--chunk-size", type=int, default=1_000_000, help="Positions per chunk"
     )
     parser.add_argument(
         "--max-positions", type=int, help="Maximum positions to process"

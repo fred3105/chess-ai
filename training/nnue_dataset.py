@@ -119,7 +119,7 @@ class DatasetGenerator:
     def generate_from_pgn(
         self,
         pgn_file: str,
-        max_positions: int,
+        max_positions: int | float,
     ) -> list[ChessPosition]:
         """Generate positions from PGN file"""
         positions = []
@@ -132,12 +132,15 @@ class DatasetGenerator:
 
                 # Extract positions from game
                 game_positions = self._extract_positions_from_game(game)
-                positions.extend(
-                    game_positions[: min(50, max_positions - len(positions))]
-                )
+                # Take all positions from game, up to remaining limit
+                if max_positions == float('inf'):
+                    positions.extend(game_positions)
+                else:
+                    remaining = max_positions - len(positions)
+                    positions.extend(game_positions[:remaining])
 
-                if len(positions) % 1000 == 0:
-                    logger.info(f"Extracted {len(positions)} positions")
+                if len(positions) % 10000 == 0:
+                    logger.info(f"Extracted {len(positions)} positions from {pgn_file}")
 
         return positions
 
@@ -173,9 +176,9 @@ class DatasetGenerator:
             if pos_type == PositionType.TACTICAL:
                 continue
 
-            # Higher sampling rate for quality positions from grandmaster games
-            # Sample more frequently to get good variety
-            sample_rate = 0.2  # 20% of positions from grandmaster games
+            # Sample all quality positions from grandmaster games
+            # Use higher sampling rate to get more positions
+            sample_rate = 1.0  # Take all qualifying positions
             if random.random() < sample_rate:
                 # Evaluation based on material and outcome - more sophisticated for GM games
                 eval_score = self._sophisticated_evaluation(board, outcome, move_count)
