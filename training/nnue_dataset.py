@@ -8,7 +8,6 @@ import chess.pgn
 import numpy as np
 import torch
 import torch.utils.data as data
-
 from nnue_model import HalfKPFeatureExtractor
 
 logging.basicConfig(level=logging.INFO)
@@ -113,17 +112,14 @@ class PositionType:
 class DatasetGenerator:
     """Generate training datasets from various sources with careful position selection"""
 
-    def __init__(self, engine_path: str | None = None, engine_depth: int = 15):
+    def __init__(self, engine_path: str | None = None):
         self.engine_path = engine_path
-        self.engine_depth = engine_depth
         self.feature_extractor = HalfKPFeatureExtractor()
 
     def generate_from_pgn(
         self,
         pgn_file: str,
-        max_positions: int = 100000,
-        min_elo: int = 2000,
-        filter_quiet: bool = True,
+        max_positions: int,
     ) -> list[ChessPosition]:
         """Generate positions from PGN file"""
         positions = []
@@ -134,18 +130,8 @@ class DatasetGenerator:
                 if game is None:
                     break
 
-                # Filter by player rating
-                white_elo = game.headers.get("WhiteElo", "0")
-                black_elo = game.headers.get("BlackElo", "0")
-
-                try:
-                    if int(white_elo) < min_elo or int(black_elo) < min_elo:
-                        continue
-                except ValueError:
-                    continue
-
                 # Extract positions from game
-                game_positions = self._extract_positions_from_game(game, filter_quiet)
+                game_positions = self._extract_positions_from_game(game)
                 positions.extend(
                     game_positions[: min(50, max_positions - len(positions))]
                 )
@@ -155,9 +141,7 @@ class DatasetGenerator:
 
         return positions
 
-    def _extract_positions_from_game(
-        self, game: chess.pgn.Game, filter_quiet: bool = True
-    ) -> list[ChessPosition]:
+    def _extract_positions_from_game(self, game: chess.pgn.Game) -> list[ChessPosition]:
         """Extract positions from a single game"""
         positions = []
         board = game.board()
@@ -165,11 +149,11 @@ class DatasetGenerator:
         # Get game outcome (using standard -1, 0, 1 encoding)
         result = game.headers.get("Result", "*")
         if result == "1-0":
-            outcome = 1.0   # White wins
+            outcome = 1.0  # White wins
         elif result == "0-1":
             outcome = -1.0  # Black wins
         elif result == "1/2-1/2":
-            outcome = 0.0   # Draw
+            outcome = 0.0  # Draw
         else:
             return positions
 
@@ -179,14 +163,14 @@ class DatasetGenerator:
             move_count += 1
 
             # Skip opening and endgame
-            if move_count < 10 or len(board.piece_map()) < 8:
+            if move_count < 4 or len(board.piece_map()) < 4:
                 continue
 
             # Classify position type
             pos_type = self._classify_position(board)
 
             # Filter based on filter_quiet parameter
-            if filter_quiet and pos_type != PositionType.QUIET:
+            if pos_type == PositionType.TACTICAL:
                 continue
 
             # Higher sampling rate for quality positions from grandmaster games
@@ -292,7 +276,7 @@ class DatasetGenerator:
 
         # Check material imbalance
         material_imbalance = self._calculate_material_imbalance(board)
-        if abs(material_imbalance) > 300:  # More than 3 pawns difference
+        if abs(material_imbalance) >= 300:  # More than 3 pawns difference
             return PositionType.IMBALANCED
 
         # Check for unusual positions (few pieces, pawn endgames, etc.)
@@ -438,59 +422,6 @@ class DatasetGenerator:
 
         return positions
 
-    def engine_evaluate_positions(
-        self, positions: list[ChessPosition], batch_size: int = 100
-    ) -> list[ChessPosition]:
-        """Evaluate positions with engine if available"""
-        if not self.engine_path or not os.path.exists(self.engine_path):
-            logger.warning("Engine not available, using existing evaluations")
-            return positions
-
-        evaluated_positions = []
-
-        try:
-            with chess.engine.SimpleEngine.popen_uci(self.engine_path) as engine:
-                for i in range(0, len(positions), batch_size):
-                    batch = positions[i : i + batch_size]
-                    batch_evaluated = []
-
-                    for pos in batch:
-                        try:
-                            board = chess.Board(pos.fen)
-                            info = engine.analyse(
-                                board,
-                                chess.engine.Limit(depth=self.engine_depth),
-                                multipv=1,
-                            )
-
-                            if "score" in info:
-                                score = info["score"].white()
-                            else:
-                                continue
-                            if score.is_mate():
-                                eval_cp = 10000 if score.mate() > 0 else -10000
-                            else:
-                                eval_cp = score.score() or 0
-
-                            batch_evaluated.append(
-                                ChessPosition(pos.fen, float(eval_cp), pos.outcome)
-                            )
-
-                        except Exception as e:
-                            logger.warning(f"Failed to evaluate position: {e}")
-                            batch_evaluated.append(pos)  # Keep original
-
-                    evaluated_positions.extend(batch_evaluated)
-
-                    if i % 1000 == 0:
-                        logger.info(f"Evaluated {i + len(batch)} positions")
-
-        except Exception as e:
-            logger.error(f"Engine evaluation failed: {e}")
-            return positions
-
-        return evaluated_positions
-
 
 def create_balanced_datasets(
     data_dir: str = "data",
@@ -498,7 +429,6 @@ def create_balanced_datasets(
     val_size: int = 50000,
     pgn_files: list[str] | None = None,
     engine_path: str | None = None,
-    min_elo: int = 2000,
 ) -> tuple[NNUEDataset, NNUEDataset]:
     """Create carefully balanced training and validation datasets from grandmaster PGN files"""
 
@@ -517,8 +447,6 @@ def create_balanced_datasets(
                     pgn_file,
                     max_positions=target_positions
                     - len(all_positions),  # Only get what we need
-                    min_elo=min_elo,
-                    filter_quiet=False,  # Don't filter, we'll balance later
                 )
                 all_positions.extend(positions)
                 logger.info(f"Found {len(positions)} positions from {pgn_file}")

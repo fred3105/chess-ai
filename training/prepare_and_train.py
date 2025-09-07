@@ -589,9 +589,20 @@ def train_with_chunks(args, use_wandb: bool) -> int:
     val_positions = val_chunk[: args.val_size]
     logger.info(f"📊 Created validation set: {len(val_positions):,} positions")
 
-    # Calculate total chunks
-    total_chunks = (total_positions + args.chunk_size - 1) // args.chunk_size
-    logger.info(f"📈 Total chunks to process: {total_chunks}")
+    # Get actual chunk count from metadata
+    chunk_path = Path(args.positions_file)
+    metadata_file = chunk_path / "dataset_metadata.pkl"
+
+    if metadata_file.exists():
+        with open(metadata_file, "rb") as f:
+            metadata = pickle.load(f)
+        total_chunks = metadata["total_chunks"]
+        logger.info(f"📈 Total chunks to process: {total_chunks} (from metadata)")
+    else:
+        # Fallback calculation for non-chunked datasets
+        total_chunks = (total_positions + args.chunk_size - 1) // args.chunk_size
+        logger.info(f"📈 Total chunks to process: {total_chunks} (calculated)")
+
     logger.info(f"📊 Total positions: {total_positions:,}")
 
     # Create validation dataset (reused across chunks)

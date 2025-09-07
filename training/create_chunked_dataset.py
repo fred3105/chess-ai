@@ -69,10 +69,10 @@ def create_chunked_dataset(
             if max_positions:
                 max_per_file = max_positions // len(pgn_files)
             else:
-                max_per_file = 10000  # Default reasonable limit per file
+                max_per_file = 50000  # Increased limit per file for better chunking
 
             positions = generator.generate_from_pgn(
-                pgn_file, max_positions=max_per_file, min_elo=2000
+                pgn_file, max_positions=max_per_file
             )
 
             for position in positions:

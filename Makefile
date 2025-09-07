@@ -40,7 +40,7 @@ dataset-medium: ## Create dataset with 500K chunks
 	$(MAKE) dataset CHUNK_SIZE=500000
 
 dataset-large: ## Create dataset with 2M chunks
-	$(MAKE) dataset CHUNK_SIZE=2000000
+	$(MAKE) dataset CHUNK_SIZE=1000000
 
 # Training with specific configurations
 train-fast: ## Train with minimal settings for quick testing
