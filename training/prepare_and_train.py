@@ -823,7 +823,7 @@ def main():
     # Dataset parameters
     parser.add_argument(
         "--positions-file",
-        default="full_dataset/all_positional_positions.pkl",
+        default="chunked_dataset/",
         help="Path to saved positions file",
     )
     parser.add_argument(
@@ -958,7 +958,7 @@ def main():
             project=args.wandb_project,
             name=args.wandb_name or f"nnue-{args.hidden_dim}-{args.epochs}ep",
             config=vars(args),
-            tags=["fast-inference", "51M-positions", "positional", "nnue"],
+            tags=["nnue"],
         )
         logger.info("🔗 Wandb logging initialized")
 
