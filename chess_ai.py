@@ -8,7 +8,7 @@ from PIL import Image
 
 
 class ChessGUI:
-    def __init__(self, ai, human_color="black", depth=4):
+    def __init__(self, ai, human_color="black", depth=5):
         pygame.init()
 
         self.ai = ai
