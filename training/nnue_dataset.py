@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import struct
 
 import chess
 import chess.engine
@@ -16,6 +17,10 @@ logger = logging.getLogger(__name__)
 
 class ChessPosition:
     """Represents a chess position with evaluation"""
+
+    # Binary format: 48 bytes total for efficient storage
+    STRUCT_FORMAT = '<32s B B H f f B 11x'  # little-endian, 48 bytes total
+    STRUCT_SIZE = struct.calcsize(STRUCT_FORMAT)
 
     def __init__(
         self,
@@ -33,21 +38,204 @@ class ChessPosition:
             position_type  # Position type: quiet, tactical, imbalanced, unusual
         )
 
+    def to_bytes(self) -> bytes:
+        """Convert position to binary format for efficient storage"""
+        board = chess.Board(self.fen)
+
+        # Pack board state (32 bytes)
+        board_bytes = self._pack_board(board)
+
+        # Pack metadata
+        castling_turn = (self._pack_castling(board) << 4) | (1 if board.turn else 0)
+        en_passant = board.ep_square if board.ep_square else 255
+        clock_move = (board.halfmove_clock << 8) | min(board.fullmove_number, 255)
+
+        # Position type as integer
+        type_map = {"quiet": 0, "tactical": 1, "imbalanced": 2, "unusual": 3}
+        pos_type_int = type_map.get(self.position_type, 0)
+
+        return struct.pack(
+            self.STRUCT_FORMAT,
+            board_bytes,
+            castling_turn,
+            en_passant,
+            clock_move,
+            self.evaluation,
+            self.outcome if self.outcome is not None else -999.0,  # Special value for None
+            pos_type_int
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> 'ChessPosition':
+        """Create position from binary format"""
+        if len(data) != cls.STRUCT_SIZE:
+            raise ValueError(f"Invalid data size: {len(data)}, expected {cls.STRUCT_SIZE}")
+
+        unpacked = struct.unpack(cls.STRUCT_FORMAT, data)
+        board_bytes, castling_turn, en_passant, clock_move, evaluation, outcome, pos_type_int = unpacked
+
+        # Reconstruct board
+        board = cls._unpack_board(board_bytes)
+        board.turn = bool(castling_turn & 0x0F)
+
+        # Restore castling rights properly
+        castling_rights_val = (castling_turn >> 4) & 0x0F
+        board.castling_rights = 0
+        if castling_rights_val & 0x01:
+            board.castling_rights |= chess.BB_H1  # White kingside
+        if castling_rights_val & 0x02:
+            board.castling_rights |= chess.BB_A1  # White queenside
+        if castling_rights_val & 0x04:
+            board.castling_rights |= chess.BB_H8  # Black kingside
+        if castling_rights_val & 0x08:
+            board.castling_rights |= chess.BB_A8  # Black queenside
+
+        board.ep_square = en_passant if en_passant != 255 else None
+        board.halfmove_clock = (clock_move >> 8) & 0xFF
+        board.fullmove_number = clock_move & 0xFF
+
+        # Position type
+        type_map = {0: "quiet", 1: "tactical", 2: "imbalanced", 3: "unusual"}
+        position_type = type_map.get(pos_type_int, "quiet")
+
+        return cls(board.fen(), evaluation, outcome if outcome != -999.0 else None, position_type)
+
+    def _pack_board(self, board: chess.Board) -> bytes:
+        """Pack board state into 32 bytes (4 bits per square)"""
+        piece_map = {
+            None: 0,
+            chess.PAWN: 1, chess.KNIGHT: 2, chess.BISHOP: 3,
+            chess.ROOK: 4, chess.QUEEN: 5, chess.KING: 6
+        }
+
+        packed = bytearray(32)
+        for square in chess.SQUARES:
+            piece = board.piece_at(square)
+            value = 0
+            if piece:
+                value = piece_map[piece.piece_type]
+                if not piece.color:  # Black pieces
+                    value |= 0x08  # Set high bit
+
+            byte_idx = square // 2
+            if square % 2 == 0:
+                packed[byte_idx] |= value
+            else:
+                packed[byte_idx] |= (value << 4)
+
+        return bytes(packed)
+
+    @classmethod
+    def _unpack_board(cls, board_bytes: bytes) -> chess.Board:
+        """Unpack board state from 32 bytes"""
+        board = chess.Board(None)  # Empty board
+        board.clear()
+
+        piece_types = {
+            1: chess.PAWN, 2: chess.KNIGHT, 3: chess.BISHOP,
+            4: chess.ROOK, 5: chess.QUEEN, 6: chess.KING
+        }
+
+        for square in chess.SQUARES:
+            byte_idx = square // 2
+            if square % 2 == 0:
+                value = board_bytes[byte_idx] & 0x0F
+            else:
+                value = (board_bytes[byte_idx] >> 4) & 0x0F
+
+            if value != 0:
+                piece_type = piece_types[value & 0x07]
+                color = chess.WHITE if (value & 0x08) == 0 else chess.BLACK
+                board.set_piece_at(square, chess.Piece(piece_type, color))
+
+        return board
+
+    def _pack_castling(self, board: chess.Board) -> int:
+        """Pack castling rights into 4 bits"""
+        rights = 0
+        if board.has_kingside_castling_rights(chess.WHITE):
+            rights |= 0x01
+        if board.has_queenside_castling_rights(chess.WHITE):
+            rights |= 0x02
+        if board.has_kingside_castling_rights(chess.BLACK):
+            rights |= 0x04
+        if board.has_queenside_castling_rights(chess.BLACK):
+            rights |= 0x08
+        return rights
+
 
 class NNUEDataset(data.Dataset):
-    """Dataset for NNUE training"""
+    """Dataset for NNUE training with chunked loading and epoch compositing"""
 
     def __init__(
-        self, positions: list[ChessPosition], feature_extractor: HalfKPFeatureExtractor
+        self,
+        positions: list[ChessPosition] | str,
+        feature_extractor: HalfKPFeatureExtractor,
+        chunk_sample_rate: float = 1.0,
+        epoch_compositing: bool = False
     ):
-        self.positions = positions
         self.feature_extractor = feature_extractor
+        self.chunk_sample_rate = chunk_sample_rate
+        self.epoch_compositing = epoch_compositing
+        self.epoch_count = 0
+
+        if isinstance(positions, str):
+            # Chunked dataset mode
+            self.chunk_dir = positions
+            from create_chunked_dataset import load_binary_metadata
+            self.metadata = load_binary_metadata(positions)
+            self.chunk_mode = True
+            self.current_positions = []
+            self._load_new_epoch()
+        else:
+            # Traditional mode with list of positions
+            self.positions = positions
+            self.chunk_mode = False
+
+    def _load_new_epoch(self):
+        """Load positions for new epoch with chunk sampling"""
+        if not self.chunk_mode:
+            return
+
+        from create_chunked_dataset import _load_binary_chunk
+        from pathlib import Path
+
+        chunk_path = Path(self.chunk_dir)
+        chunk_files = list(chunk_path.glob("positions_chunk_*.bin"))
+        chunk_files.sort()
+
+        # Sample subset of chunks for this epoch
+        chunks_to_use = max(1, int(len(chunk_files) * self.chunk_sample_rate))
+        selected_chunks = random.sample(chunk_files, chunks_to_use)
+
+        logger.info(f"Epoch {self.epoch_count}: Loading {len(selected_chunks)} chunks out of {len(chunk_files)}")
+
+        self.current_positions = []
+        for chunk_file in selected_chunks:
+            positions = _load_binary_chunk(chunk_file)
+            self.current_positions.extend(positions)
+
+        # Shuffle positions across chunks
+        random.shuffle(self.current_positions)
+        logger.info(f"Loaded {len(self.current_positions):,} positions for epoch {self.epoch_count}")
 
     def __len__(self) -> int:
+        if self.chunk_mode:
+            return len(self.current_positions)
         return len(self.positions)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        position = self.positions[idx]
+        # Handle epoch compositing for chunked mode
+        if self.chunk_mode and self.epoch_compositing and idx >= len(self.current_positions):
+            self.epoch_count += 1
+            self._load_new_epoch()
+            idx = idx % len(self.current_positions)
+
+        if self.chunk_mode:
+            position = self.current_positions[idx]
+        else:
+            position = self.positions[idx]
+
         board = chess.Board(position.fen)
 
         # Convert board to numpy array
@@ -74,6 +262,12 @@ class NNUEDataset(data.Dataset):
         target = torch.tensor([position.evaluation], dtype=torch.float32)
 
         return white_features, black_features, target
+
+    def refresh_epoch(self):
+        """Manually trigger loading of new epoch data"""
+        if self.chunk_mode and self.epoch_compositing:
+            self.epoch_count += 1
+            self._load_new_epoch()
 
     def _board_to_array(self, board: chess.Board) -> np.ndarray:
         """Convert chess board to 8x8 numpy array"""
@@ -165,23 +359,40 @@ class DatasetGenerator:
             board.push(move)
             move_count += 1
 
-            # Skip opening and endgame
-            if move_count < 4 or len(board.piece_map()) < 4:
+            # Quality filter 1: Skip early opening and late endgame moves
+            if move_count < 8 or len(board.piece_map()) < 8:
                 continue
 
             # Classify position type
             pos_type = self._classify_position(board)
 
-            # Filter based on filter_quiet parameter
+            # Quality filter 2: Filter tactical positions
             if pos_type == PositionType.TACTICAL:
                 continue
 
-            # Sample all quality positions from grandmaster games
-            # Use higher sampling rate to get more positions
-            sample_rate = 1.0  # Take all qualifying positions
+            # Quality filter 3: Check material balance (avoid extreme imbalances)
+            material_imbalance = abs(self._calculate_material_imbalance(board))
+            if material_imbalance > 500:  # More than 5 pawns difference
+                continue
+
+            # Quality filter 4: Balanced sampling rates - 60% quiet, 20% imbalanced, 20% unusual
+            if pos_type == PositionType.QUIET:
+                sample_rate = 0.15  # Higher rate for quiet positions (60% of final dataset)
+            elif pos_type == PositionType.IMBALANCED:
+                sample_rate = 0.08  # Medium rate for imbalanced positions (20% of final dataset)
+            elif pos_type == PositionType.UNUSUAL:
+                sample_rate = 0.08  # Medium rate for unusual positions (20% of final dataset)
+            else:
+                sample_rate = 0.10  # Default rate
+
             if random.random() < sample_rate:
                 # Evaluation based on material and outcome - more sophisticated for GM games
                 eval_score = self._sophisticated_evaluation(board, outcome, move_count)
+
+                # Quality filter 5: Filter by evaluation range for balanced training
+                if abs(eval_score) > 800:  # Skip positions with extreme evaluations
+                    continue
+
                 position = ChessPosition(board.fen(), eval_score, outcome, pos_type)
                 positions.append(position)
 

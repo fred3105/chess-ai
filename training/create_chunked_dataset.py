@@ -7,6 +7,7 @@ Process PGN files and save positions in smaller chunks.
 import argparse
 import logging
 import pickle
+import struct
 from pathlib import Path
 
 from nnue_dataset import ChessPosition, DatasetGenerator
@@ -86,13 +87,12 @@ def create_chunked_dataset(
                 # Save chunk when it reaches the desired size
                 if len(current_chunk) >= chunk_size:
                     chunk_num += 1
-                    chunk_file = output_path / f"positions_chunk_{chunk_num:03d}.pkl"
+                    chunk_file = output_path / f"positions_chunk_{chunk_num:03d}.bin"
 
                     logger.info(
-                        f"💾 Saving chunk {chunk_num} with {len(current_chunk):,} positions"
+                        f"💾 Saving chunk {chunk_num} with {len(current_chunk):,} positions (binary format)"
                     )
-                    with open(chunk_file, "wb") as f:
-                        pickle.dump(current_chunk, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    _save_binary_chunk(current_chunk, chunk_file)
 
                     current_chunk = []
                     logger.info(f"✅ Chunk {chunk_num} saved: {chunk_file}")
@@ -113,13 +113,12 @@ def create_chunked_dataset(
     # Save final chunk if it has positions
     if current_chunk:
         chunk_num += 1
-        chunk_file = output_path / f"positions_chunk_{chunk_num:03d}.pkl"
+        chunk_file = output_path / f"positions_chunk_{chunk_num:03d}.bin"
 
         logger.info(
-            f"💾 Saving final chunk {chunk_num} with {len(current_chunk):,} positions"
+            f"💾 Saving final chunk {chunk_num} with {len(current_chunk):,} positions (binary format)"
         )
-        with open(chunk_file, "wb") as f:
-            pickle.dump(current_chunk, f, protocol=pickle.HIGHEST_PROTOCOL)
+        _save_binary_chunk(current_chunk, chunk_file)
 
         logger.info(f"✅ Final chunk {chunk_num} saved: {chunk_file}")
 
@@ -128,12 +127,24 @@ def create_chunked_dataset(
         "total_positions": total_processed,
         "total_chunks": chunk_num,
         "chunk_size": chunk_size,
-        "chunks": [f"positions_chunk_{i:03d}.pkl" for i in range(1, chunk_num + 1)],
+        "position_size": ChessPosition.STRUCT_SIZE,
+        "chunks": [f"positions_chunk_{i:03d}.bin" for i in range(1, chunk_num + 1)],
     }
 
+    # Save metadata in both formats for compatibility
     metadata_file = output_path / "dataset_metadata.pkl"
     with open(metadata_file, "wb") as f:
         pickle.dump(metadata, f)
+
+    # Also save binary metadata for efficient reading
+    binary_metadata_file = output_path / "dataset_metadata.bin"
+    with open(binary_metadata_file, "wb") as f:
+        f.write(struct.pack('<IIII',
+            metadata['total_chunks'],
+            metadata['total_positions'],
+            metadata['chunk_size'],
+            metadata['position_size']
+        ))
 
     logger.info("🎉 === DATASET CREATION COMPLETED ===")
     logger.info(f"📊 Total positions: {total_processed:,}")
@@ -142,6 +153,40 @@ def create_chunked_dataset(
     logger.info(f"📋 Metadata saved: {metadata_file}")
 
     return total_processed, chunk_num
+
+
+def _save_binary_chunk(positions: list[ChessPosition], chunk_file: Path):
+    """Save chunk in efficient binary format"""
+    with open(chunk_file, 'wb') as f:
+        # Write header: position count, position size
+        header = struct.pack('<II', len(positions), ChessPosition.STRUCT_SIZE)
+        f.write(header)
+
+        # Write positions
+        for pos in positions:
+            f.write(pos.to_bytes())
+
+
+def _load_binary_chunk(chunk_file: Path) -> list[ChessPosition]:
+    """Load chunk from binary format"""
+    positions = []
+
+    with open(chunk_file, 'rb') as f:
+        # Read header
+        header = f.read(8)
+        if len(header) != 8:
+            return positions
+
+        position_count, position_size = struct.unpack('<II', header)
+
+        # Read positions
+        for _ in range(position_count):
+            data = f.read(position_size)
+            if len(data) != position_size:
+                break
+            positions.append(ChessPosition.from_bytes(data))
+
+    return positions
 
 
 def load_chunk_files(chunk_dir: str) -> list[ChessPosition]:
@@ -165,12 +210,38 @@ def load_chunk_files(chunk_dir: str) -> list[ChessPosition]:
         chunk_path_full = chunk_path / chunk_file
         logger.info(f"🔄 Loading {chunk_path_full}")
 
-        with open(chunk_path_full, "rb") as f:
-            chunk_positions = pickle.load(f)
-            all_positions.extend(chunk_positions)
+        # Check if it's binary or pickle format
+        if chunk_file.endswith('.bin'):
+            chunk_positions = _load_binary_chunk(chunk_path_full)
+        else:
+            with open(chunk_path_full, "rb") as f:
+                chunk_positions = pickle.load(f)
+
+        all_positions.extend(chunk_positions)
 
     logger.info(f"✅ Loaded {len(all_positions):,} total positions")
     return all_positions
+
+
+def load_binary_metadata(chunk_dir: str) -> dict:
+    """Load metadata from binary format for efficient access"""
+    chunk_path = Path(chunk_dir)
+    binary_metadata_file = chunk_path / "dataset_metadata.bin"
+
+    if binary_metadata_file.exists():
+        with open(binary_metadata_file, 'rb') as f:
+            data = f.read(16)  # 4 integers
+            return {
+                'total_chunks': struct.unpack('<I', data[0:4])[0],
+                'total_positions': struct.unpack('<I', data[4:8])[0],
+                'chunk_size': struct.unpack('<I', data[8:12])[0],
+                'position_size': struct.unpack('<I', data[12:16])[0]
+            }
+    else:
+        # Fallback to pickle metadata
+        metadata_file = chunk_path / "dataset_metadata.pkl"
+        with open(metadata_file, "rb") as f:
+            return pickle.load(f)
 
 
 if __name__ == "__main__":
@@ -179,7 +250,7 @@ if __name__ == "__main__":
         "--data-dir", default="data/", help="Directory containing PGN files"
     )
     parser.add_argument(
-        "--chunk-size", type=int, default=1_000_000, help="Positions per chunk"
+        "--chunk-size", type=int, default=2_000_000, help="Positions per chunk"
     )
     parser.add_argument(
         "--max-positions", type=int, help="Maximum positions to process"

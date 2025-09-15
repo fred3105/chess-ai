@@ -77,8 +77,15 @@ def load_positions_from_chunks(
     chunk_file = chunk_path / metadata["chunks"][chunk_index]
     logger.info(f"📦 Loading chunk {chunk_index + 1}/{total_chunks}: {chunk_file}")
 
-    with open(chunk_file, "rb") as f:
-        positions = pickle.load(f)
+    # Check if it's a binary chunk or pickle chunk
+    if chunk_file.suffix == '.bin':
+        # Load binary chunk
+        from create_chunked_dataset import _load_binary_chunk
+        positions = _load_binary_chunk(chunk_file)
+    else:
+        # Load pickle chunk (backward compatibility)
+        with open(chunk_file, "rb") as f:
+            positions = pickle.load(f)
 
     logger.info(f"✅ Loaded {len(positions):,} positions from chunk {chunk_index + 1}")
     return positions, total_positions

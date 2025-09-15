@@ -1,7 +1,7 @@
 .PHONY: dataset train all clean help
 
 # Default chunk size (can be overridden: make dataset CHUNK_SIZE=2000000)
-CHUNK_SIZE ?= 1000000
+CHUNK_SIZE ?= 3000000
 DATA_DIR ?= data/
 DATASET_DIR ?= chunked_dataset/
 WANDB_PROJECT ?= chess-eval-optimization
@@ -21,7 +21,7 @@ train: ## Train NNUE model on chunked dataset
 	@echo "🏋️ Starting NNUE training..."
 	@echo "📦 Dataset directory: $(DATASET_DIR)"
 	@echo "📊 Wandb project: $(WANDB_PROJECT)"
-	uv run training/prepare_and_train.py --chunked-training --positions-file $(DATASET_DIR) --wandb-project $(WANDB_PROJECT)
+	uv run training/prepare_and_train.py --chunked-training --positions-file $(DATASET_DIR) --wandb-project $(WANDB_PROJECT) --epochs 200 --batch-size 256 --val-size 50000
 
 all: dataset train ## Create dataset and train model (full pipeline)
 
