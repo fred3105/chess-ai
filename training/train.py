@@ -96,11 +96,17 @@ def train_chunk(
         # Calculate loss
         loss = criterion(outputs, targets)
 
-        # Calculate accuracy
-        predictions = torch.sigmoid(outputs)
-        predicted_outcomes = (predictions > 0.5).float()
-        target_outcomes = (targets > 0.5).float()
-        correct = (predicted_outcomes == target_outcomes).sum().item()
+        # Calculate chess-specific accuracy
+        # Model now outputs [0,1] range via sigmoid, so no need to clamp
+
+        # Define outcome categories: loss (<0.33), draw (0.33-0.67), win (>0.67)
+        pred_outcomes = torch.zeros_like(outputs)
+        pred_outcomes[outputs < 0.33] = 0.0  # Loss
+        pred_outcomes[(outputs >= 0.33) & (outputs <= 0.67)] = 0.5  # Draw
+        pred_outcomes[outputs > 0.67] = 1.0  # Win
+
+        # Targets should already be 0.0, 0.5, or 1.0
+        correct = (torch.abs(pred_outcomes - targets) < 0.1).sum().item()
 
         total_correct += correct
         total_samples += targets.size(0)
@@ -130,6 +136,9 @@ def train_chunk(
                     "chunk_running_loss": current_loss,
                     "chunk_running_accuracy": current_acc,
                     "batch_progress": progress,
+                    "output_mean": outputs.mean().item(),
+                    "output_std": outputs.std().item(),
+                    "target_mean": targets.mean().item(),
                 }
             )
 
@@ -158,11 +167,13 @@ def evaluate(model, dataloader, criterion, device):
             outputs = model(white_features, black_features, stm)
             loss = criterion(outputs, targets)
 
-            # Calculate accuracy
-            predictions = torch.sigmoid(outputs)
-            predicted_outcomes = (predictions > 0.5).float()
-            target_outcomes = (targets > 0.5).float()
-            correct = (predicted_outcomes == target_outcomes).sum().item()
+            # Calculate chess-specific accuracy (same as training)
+            pred_outcomes = torch.zeros_like(outputs)
+            pred_outcomes[outputs < 0.33] = 0.0
+            pred_outcomes[(outputs >= 0.33) & (outputs <= 0.67)] = 0.5
+            pred_outcomes[outputs > 0.67] = 1.0
+
+            correct = (torch.abs(pred_outcomes - targets) < 0.1).sum().item()
 
             total_correct += correct
             total_samples += targets.size(0)
@@ -177,10 +188,10 @@ def evaluate(model, dataloader, criterion, device):
 
 def main():
     # Training parameters
-    batch_size = 1024
+    batch_size = 2048
     initial_lr = 0.001
     final_lr = 0.000001
-    num_epochs = 100  # Much longer training
+    num_epochs = 10  # Much longer training
     hidden_size = 256
 
     # Initialize wandb
@@ -266,7 +277,9 @@ def main():
                     batch_size=batch_size,
                     shuffle=True,
                     num_workers=2,
-                    pin_memory=True if device.type in ["cuda", "mps"] else False,
+                    pin_memory=True
+                    if device.type == "cuda"
+                    else False,  # MPS does not support pin_memory
                 )
 
                 # Train on this chunk

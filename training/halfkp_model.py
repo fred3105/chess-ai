@@ -92,7 +92,8 @@ class HalfKPNNUE(nn.Module):
         x = torch.relu(self.layer2(x))
         x = self.output(x)
 
-        return x.squeeze()
+        # Apply sigmoid to map to [0,1] for game outcome probabilities
+        return torch.sigmoid(x.squeeze())
 
     def _accumulate_features(self, feature_indices, batch_size):
         """Accumulate features from sparse indices"""
