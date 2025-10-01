@@ -5,6 +5,7 @@ Clean and straightforward implementation
 """
 
 import time
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -186,6 +187,30 @@ def evaluate(model, dataloader, criterion, device):
     return avg_loss, accuracy
 
 
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler):
+    """Load checkpoint and return start epoch, best accuracy, best loss"""
+    try:
+        print(f"📂 Loading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path)
+
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        start_epoch = checkpoint['epoch']
+        best_accuracy = checkpoint.get('best_accuracy', 0.0)
+        best_loss = checkpoint.get('best_loss', float('inf'))
+
+        print(f"✅ Resumed from epoch {start_epoch}")
+        print(f"   Best accuracy so far: {best_accuracy:.4f}")
+        print(f"   Best loss so far: {best_loss:.6f}")
+
+        return start_epoch, best_accuracy, best_loss
+    except Exception as e:
+        print(f"⚠️  Could not load checkpoint: {e}")
+        return 0, 0.0, float('inf')
+
+
 def main():
     # Training parameters
     batch_size = 2048
@@ -193,6 +218,10 @@ def main():
     final_lr = 0.000001
     num_epochs = 10  # Much longer training
     hidden_size = 256
+
+    # Checkpoint settings
+    resume_from_checkpoint = "latest_checkpoint.pt"  # Change to None to start fresh
+    save_every_n_epochs = 2  # Save checkpoint every 2 epochs
 
     # Initialize wandb
     wandb.init(
@@ -207,6 +236,7 @@ def main():
             "input_features": 40960,
             "training_approach": "chunk_by_chunk",
             "scheduler": "cosine_annealing",
+            "resume_from": resume_from_checkpoint,
         },
     )
 
@@ -249,15 +279,25 @@ def main():
     # Cosine annealing scheduler
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=final_lr)
 
+    # Try to resume from checkpoint
+    start_epoch = 0
+    best_accuracy = 0.0
+    best_loss = float("inf")
+
+    if resume_from_checkpoint and Path(resume_from_checkpoint).exists():
+        start_epoch, best_accuracy, best_loss = load_checkpoint(
+            resume_from_checkpoint, model, optimizer, scheduler
+        )
+    else:
+        print("🆕 Starting fresh training")
+
     print(
         f"📈 Learning rate schedule: {initial_lr:.6f} → {final_lr:.6f} over {num_epochs} epochs"
     )
 
     # Training loop - chunk by chunk approach
-    best_accuracy = 0.0
-    best_loss = float("inf")
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         print(f"\n🔥 EPOCH {epoch + 1}/{num_epochs}")
         epoch_start_time = time.time()
 
@@ -268,6 +308,10 @@ def main():
         for chunk_idx, train_chunk_file in enumerate(train_chunks):
             chunk_name = train_chunk_file.name
             print(f"  📁 Chunk {chunk_idx + 1}/{len(train_chunks)}: {chunk_name}")
+
+            # Initialize to None to avoid unbound errors
+            train_dataset = None
+            train_loader = None
 
             # Load chunk dataset
             try:
@@ -303,6 +347,17 @@ def main():
             except Exception as e:
                 print(f"    ❌ Error processing {chunk_name}: {e}")
                 continue
+            finally:
+                # Clean up memory after each chunk
+                if train_dataset is not None:
+                    del train_dataset
+                if train_loader is not None:
+                    del train_loader
+                if device.type == "mps":
+                    torch.mps.empty_cache()
+                elif device.type == "cuda":
+                    torch.cuda.empty_cache()
+                print(f"    🧹 Memory cleared after {chunk_name}")
 
         # Calculate epoch averages
         avg_train_loss = (
@@ -327,6 +382,16 @@ def main():
                     pin_memory=True if device.type in ["cuda", "mps"] else False,
                 )
                 test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+
+                # Clean up test memory too
+                del test_dataset
+                del test_loader
+                if device.type == "mps":
+                    torch.mps.empty_cache()
+                elif device.type == "cuda":
+                    torch.cuda.empty_cache()
+                print("    🧹 Test memory cleared")
+
             except Exception as e:
                 print(f"    ❌ Error in evaluation: {e}")
                 test_loss, test_acc = float("inf"), 0.0
@@ -364,9 +429,12 @@ def main():
                     "epoch": epoch + 1,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "train_loss": avg_train_loss,
                     "test_loss": test_loss,
                     "test_accuracy": test_acc,
+                    "best_accuracy": best_accuracy,
+                    "best_loss": best_loss,
                 },
                 "best_model.pt",
             )
@@ -378,22 +446,22 @@ def main():
         # Step the scheduler
         scheduler.step()
 
-        # Save checkpoint every 10 epochs
-        if (epoch + 1) % 10 == 0:
-            checkpoint_path = f"checkpoint_epoch_{epoch + 1}.pt"
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "train_loss": avg_train_loss,
-                    "test_loss": test_loss,
-                    "test_accuracy": test_acc,
-                },
-                checkpoint_path,
-            )
-            print(f"    💾 Checkpoint saved: {checkpoint_path}")
+        # Always save latest checkpoint every epoch
+        torch.save(
+            {
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "train_loss": avg_train_loss,
+                "test_loss": test_loss,
+                "test_accuracy": test_acc,
+                "best_accuracy": best_accuracy,
+                "best_loss": best_loss,
+            },
+            "latest_checkpoint.pt",
+        )
+        print(f"    💾 Latest checkpoint saved: epoch {epoch + 1}")
 
     print("\n🎉 Training Complete!")
     print(f"   Best test accuracy: {best_accuracy:.4f}")
