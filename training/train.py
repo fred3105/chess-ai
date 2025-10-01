@@ -193,13 +193,13 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler):
         print(f"📂 Loading checkpoint: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path)
 
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
-        start_epoch = checkpoint['epoch']
-        best_accuracy = checkpoint.get('best_accuracy', 0.0)
-        best_loss = checkpoint.get('best_loss', float('inf'))
+        start_epoch = checkpoint["epoch"]
+        best_accuracy = checkpoint.get("best_accuracy", 0.0)
+        best_loss = checkpoint.get("best_loss", float("inf"))
 
         print(f"✅ Resumed from epoch {start_epoch}")
         print(f"   Best accuracy so far: {best_accuracy:.4f}")
@@ -208,7 +208,7 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler):
         return start_epoch, best_accuracy, best_loss
     except Exception as e:
         print(f"⚠️  Could not load checkpoint: {e}")
-        return 0, 0.0, float('inf')
+        return 0, 0.0, float("inf")
 
 
 def main():
@@ -221,7 +221,6 @@ def main():
 
     # Checkpoint settings
     resume_from_checkpoint = "latest_checkpoint.pt"  # Change to None to start fresh
-    save_every_n_epochs = 2  # Save checkpoint every 2 epochs
 
     # Initialize wandb
     wandb.init(
@@ -241,7 +240,13 @@ def main():
     )
 
     # Device
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device(
+        "mps"
+        if torch.backends.mps.is_available()
+        else "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
     print(f"Using device: {device}")
     wandb.config.update({"device": str(device)})
 
