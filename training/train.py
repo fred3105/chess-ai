@@ -212,11 +212,11 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler):
 
 
 def main():
-    # Training parameters
-    batch_size = 2048
-    initial_lr = 0.001
-    final_lr = 0.000001
-    num_epochs = 10  # Much longer training
+    # Training parameters - optimized for L40s GPU
+    batch_size = 8192
+    initial_lr = 0.002
+    final_lr = 0.00001
+    num_epochs = 25
     hidden_size = 256
 
     # Checkpoint settings
