@@ -188,4 +188,3 @@ cython_debug/
 /wandb
 *.json
 *.pkl
-/chunked_dataset
