@@ -68,7 +68,7 @@ def preload_all_data_to_gpu(chunk_files, device, max_chunks=None):
                 stm_tensor[idx] = stm
                 target_tensor[idx] = result
 
-            except Exception as e:
+            except Exception:
                 # Leave as dummy data (already initialized)
                 target_tensor[idx] = 0.5
 
@@ -376,9 +376,6 @@ def main():
 
         epoch_start_time = time.time()
 
-        # Generate random shuffle indices for this epoch
-        shuffle_indices = torch.randperm(len(train_targets), device=device)
-
         # Train
         print(f"\n  📊 Training on {len(train_targets):,} positions...")
         train_loss, train_acc = train_epoch_gpu(
@@ -390,7 +387,6 @@ def main():
             optimizer,
             criterion,
             batch_size,
-            shuffle_indices=shuffle_indices,
         )
 
         print(f"  ✓ Training complete: Loss {train_loss:.6f} | Acc {train_acc:.4f}")
